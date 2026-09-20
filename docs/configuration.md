@@ -127,3 +127,29 @@ Sessions issued before the change stay valid until they expire; delete
 
 Changing a listener's **port** needs a restart. The TLS **certificate** does
 not: `/control/tls/configure` takes effect on the next handshake.
+
+## When memory climbs
+
+Nothing listens on 6060 here, and `http.pprof` in the config file is kept and
+not acted on. What replaces it is `GET /control/debug/memory`, which needs
+only a signed-in session and reports, as JSON, what the process is holding:
+the resident size and its high-water mark, the container's own `memory.current`
+and `memory.stat`, and a count for every structure inside the server — the
+cached answers and the bytes they take, the compiled expressions against the
+ceiling they are kept under, the names counted in the hour of statistics in
+progress, the buffered query-log entries, the discovered clients, and the
+per-address tables the rate limiter and the connection probe keep.
+
+```
+curl -su admin:<password> http://localhost:3000/control/debug/memory
+```
+
+Two snapshots an hour apart are the useful thing: the count that grew between
+them is where the memory went. `scripts/memwatch.py` in the source tree takes
+them on a timer and prints what moved.
+
+A resident size that climbs for the first hours of an installation's life and
+then settles is normal — the filter lists are loaded once, the response cache
+fills to `dns.cache_size`, and the hour of statistics is as large as the names
+asked for in it. A number that keeps climbing days later is worth reporting,
+with the output of that endpoint attached.

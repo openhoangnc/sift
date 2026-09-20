@@ -174,6 +174,24 @@ impl Runtime {
         self.clients.read().contains_key(&addr)
     }
 
+    /// How many addresses the store holds, and how many of those carry a
+    /// WHOIS record.
+    ///
+    /// Nothing evicts from here: an address is added the first time it asks
+    /// something and kept for the life of the process, so on a resolver open
+    /// to the internet this grows with the number of distinct sources that
+    /// have ever reached it.  That is upstream's behaviour too, and it is
+    /// bounded by the network on a home installation -- but it is the first
+    /// number to read when a resolver that is exposed keeps growing.
+    pub fn sizes(&self) -> (usize, usize) {
+        let map = self.clients.read();
+
+        (
+            map.len(),
+            map.values().filter(|c| !c.whois.is_empty()).count(),
+        )
+    }
+
     /// Forgets everything.
     pub fn clear(&self) {
         self.clients.write().clear();

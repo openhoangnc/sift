@@ -5,6 +5,7 @@ pub mod handlers;
 pub mod http3;
 pub mod https;
 pub mod netiface;
+pub mod procmem;
 pub mod routes;
 pub mod state;
 pub mod ui;

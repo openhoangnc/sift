@@ -258,6 +258,14 @@ impl QueryLog {
         out
     }
 
+    /// The number of entries the recent-entry ring holds.
+    ///
+    /// Capped at [`RECENT_CAP`], so this stands still once the server has
+    /// been asked that many things; a snapshot reports it to say so.
+    pub fn recent(&self) -> usize {
+        self.recent.lock().len()
+    }
+
     /// The number of entries held in memory.
     pub fn buffered(&self) -> usize {
         self.pending.lock().len()

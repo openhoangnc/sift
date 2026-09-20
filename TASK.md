@@ -19,7 +19,7 @@ Verification claims below are reproducible with `scripts/verify.sh` and
 | Upstreams | plain UDP/TCP, DoT, DoH, DoH/3, DoQ done · DNSCrypt **out of scope** |
 | Query log | done, byte-identical |
 | Statistics | done, `stats.db` interoperable both ways |
-| HTTP API | all 81 upstream paths routed · 69 implemented, 12 refuse by design · one path and one parameter added |
+| HTTP API | all 81 upstream paths routed · 69 implemented, 12 refuse by design · two paths and one parameter added |
 | Web interface | rewritten in `web/client`, built to `web/build`, embedded |
 | Docker | done, same runtime contract |
 | DHCP | **out of scope** — API reports it off and refuses changes |
@@ -255,6 +255,12 @@ Verification claims below are reproducible with `scripts/verify.sh` and
       blocklists the picker offers — the 64 AdGuard bundles in its client,
       and two of ours. Serving it rather than bundling it keeps
       `web/client` free of AdGuard's material — see *Deliberate deviations*
+- [x] **A second path added**: `GET /control/debug/memory`, what the process
+      is holding and where — the resident size and the cgroup's own numbers
+      beside a count for every structure that has ever grown here. Nothing in
+      the web interface asks for it; it is for watching a container, which is
+      how both of the leaks below were found. `scripts/memwatch.py` polls it
+      and prints what moved
 - [x] **One parameter added**: `filter_id` on `GET /control/querylog`, keeping
       only the entries a rule from that list matched, so the query log's list
       filter works across the whole log rather than the page in hand. Parsed
@@ -1268,6 +1274,144 @@ building one costs 105 microseconds, and the point is not to pay that again for
 the one name the network asks for constantly. Dropping one costs nothing but
 building it again, which `only_so_many_expressions_are_kept_built` checks along
 with the verdict being the same either way.
+
+## Watching the third climb: the snapshot, rather than the guess
+
+Both leaks above were found the same way: watch a container, form a hypothesis
+about which structure the climb belonged to, and add a print statement to test
+it. That worked twice and cost a day each time, and the second one was only
+narrowed down by switching features off one at a time on a live resolver.
+
+`GET /control/debug/memory` reports the evidence directly. Ours, gated with
+the rest of `/control`, and nothing in the web interface asks for it.
+
+- **What the kernel says**: resident size, `VmHWM`, resident anonymous and
+  file-backed memory, threads, descriptors and the number of mapped regions.
+  The high-water mark is the one worth having beside the resident size: the two
+  rising together is something still being held, and a gap between them is the
+  allocator keeping a peak it has not given back.
+- **What the container says**: the cgroup's `memory.current`, its peak and its
+  limit, and `anon`, `file`, `slab` and `sock` out of `memory.stat`. That first
+  number is what `docker stats` shows, which is what an operator is looking at
+  when they ask the question. `anon` against `file` is the answer to "is it
+  page cache" without shelling into the container, which the second
+  investigation above had to do by hand.
+- **What each structure holds**: a count per subsystem, listed below.
+
+**Counts, not estimated bytes.** Only the response cache knows its own size.
+Everything else reports how many of something it is holding, which is honest
+and enough: a count that climbs with the resident size is where the memory
+went, and a count that stands still while the resident size climbs says just
+as much — that was the shape of the expression-cache leak, where the
+statistics and the cache were flat the whole way up.
+
+**No allocation-site profiler, deliberately.** That would mean a custom global
+allocator or a call to `mallinfo2`, and the tree carries no unsafe code and no
+`libc`; `unsafe_code = "deny"` is a workspace lint, and everything the kernel
+exposes is a file read. If an allocation-site breakdown is ever genuinely
+needed, the honest way is a `jemalloc` feature that is off in the shipping
+build, not unsafe in the tree — and the numbers here should be exhausted
+first, because both leaks so far were a structure anybody could count.
+
+**If the counters are flat and the resident size still climbs, it is the
+allocator, and the allocator here is musl's.** Every Linux build is statically
+linked against musl — `rust:1.98-alpine` in `docker/Dockerfile`, and
+`*-unknown-linux-musl` in the release workflow — so `mallocng` is what is
+holding the memory, not glibc. `MALLOC_ARENA_MAX` is a glibc knob and does
+nothing here; there is no equivalent to tune. What the snapshot says in that
+case is `process.rss` climbing while `process.peak_rss` tracks it and every
+count stands still, and the experiment that follows is a different allocator
+behind a feature flag, measured against the same load. Nothing has been
+measured on that yet — it is written down so the next session does not reach
+for the glibc answer to a musl question.
+
+### What the fields say, and what is already bounded
+
+Every structure in the process that has grown without bound here is now
+bounded, and the snapshot reports each one against its bound:
+
+| Field | Bound | What an unbounded climb would mean |
+|---|---|---|
+| `filters.compiled_expressions` | `MAX_COMPILED`, 2,000 | the ceiling is not holding |
+| `filters.list_bytes` | the lists themselves | a refresh that keeps the old text |
+| `cache.bytes` | `dns.cache_size` | the size accounting is wrong |
+| `cache.eviction_slots` | compaction at twice the entries | the slot leak is back |
+| `stats.live_domains` | an hour of traffic | the hour is not rolling |
+| `stats.past_hours` | `statistics.interval` | pruning has stopped |
+| `querylog.recent` | `RECENT_CAP`, 5,000 | the ring is not dropping |
+| `server.ratelimit_buckets` | swept at 16,384, dropping five-minute-idle | sources active in one window, not a leak |
+| `server.probe_marks` | swept at 16,384, keeping the live ones | the same |
+| `clients.runtime` | **nothing** | see below |
+
+`clients.runtime` is the one with no bound: an address is recorded the first
+time it asks something and kept for the life of the process, with a reverse
+name and, where WHOIS is on, an organisation, a city and a country. That is
+upstream's behaviour and it is bounded by the network on a home installation —
+19 addresses on the deployment above — but on a resolver reachable from the
+internet it counts every distinct source that has ever reached it. The
+snapshot reports it and how many of those carry a WHOIS record, which is the
+expensive half. Nothing has been changed about it: a bound would be a
+behaviour change, and the number should be looked at before it is chosen.
+
+### What the high-water mark turned out to say
+
+The first deployment to be asked for these numbers reported `VmHWM` 660.7 MB
+against `VmRSS` 386.9 MB, with `memory.stat` saying `anon` 378.8 MB and `file`
+48.7 MB. Two things follow from that pair before anything is instrumented: it
+is the heap and not page cache, and **274 MB had already been given back** —
+a process that never returns memory sits at its own high-water mark.
+
+What took it there was measured rather than guessed, in the published image on
+the same architecture and the same libc (`linux/arm64`, static musl), with
+514,587 rules across three lists:
+
+| | RSS | `VmHWM` |
+|---|---:|---:|
+| one 181k-rule list loaded | 31.3 MB | 41.8 MB |
+| three lists, 514,587 rules | 89.6 MB | 146.2 MB |
+| after one forced rebuild | 88.7 MB | 171.8 MB |
+| after a second rebuild | 89.0 MB | 171.8 MB |
+
+- **Loading lists costs about 1.63× the steady size**, transiently, and musl
+  gives it back. The reporting deployment's own ratio is 1.71×.
+- **A rebuild costs one more engine.** The first one raised the high-water
+  mark by 28.3 MB where the rules alone are 514,587 × 56 bytes = 28.8 MB:
+  `reload_filters` calls `build_engine` and only then `set_engine`, so both
+  engines are live for the length of the build. At 2.29M rules that is 128 MB
+  of rules for the second copy.
+- **The second rebuild raised it by nothing**, and the steady size did not
+  move across either: the space the first one took is reused, so the peak is
+  reached once rather than climbing with every refresh. Nothing leaks across a
+  rebuild.
+
+Two things worth keeping in mind because of it. A memory limit has to leave
+room for the transient, not the steady size — roughly 1.7× — or the daily
+refresh is what kills the container, at the one moment the operator is not
+watching. And on macOS the same rebuild shows *no* RSS bump at all, because
+the allocator satisfies the second engine out of space it already holds; the
+high-water mark is the only honest way to see it, which is why `peak_rss` is
+in the snapshot.
+
+### Using it
+
+```bash
+scripts/memwatch.py -u http://host:3000 -p <password> -i 5m
+```
+
+Python 3 and nothing else. Each line is a sample; Ctrl-C prints the first
+sample against the last, sorted by how much each number moved, with what did
+not move on one line at the end. `--once` prints a single snapshot whole.
+
+Verified against a running server: five queries moved the cache, the live
+hour's names and both query-log buffers by exactly the four new names between
+two samples, and the resident size by 64 KB. The three tests in
+`crates/sift-api/tests/memory.rs` seed a different amount into every subsystem,
+so a field wired to the wrong source reads another subsystem's number.
+
+**Not yet used to find anything.** It exists because the next climb should
+cost an hour rather than a day.
+
+---
 
 ## Found reading the Go search code beside ours, and fixed
 

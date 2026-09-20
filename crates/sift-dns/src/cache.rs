@@ -493,10 +493,11 @@ impl Cache {
 
     /// The number of eviction slots held across every shard.
     ///
-    /// Only the tests care: this is the number that used to grow without
-    /// bound, so it is the one worth asserting on.
-    #[cfg(test)]
-    fn order_len(&self) -> usize {
+    /// This is the number that used to grow without bound, so it is the one
+    /// worth asserting on -- and the one a memory snapshot reports beside the
+    /// entry count, since a shard comfortably inside its budget is exactly
+    /// where the two used to drift apart.
+    pub fn order_len(&self) -> usize {
         self.shards.iter().map(|s| s.lock().order.len()).sum()
     }
 }

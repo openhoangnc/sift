@@ -13,7 +13,7 @@ use serde_json::json;
 
 use crate::doh;
 use crate::error::{ApiError, ApiResult};
-use crate::handlers::{filtering, logs, misc, status};
+use crate::handlers::{filtering, logs, memory, misc, status};
 use crate::state::Shared;
 
 /// Paths reachable without a session, always.
@@ -330,6 +330,10 @@ fn control_router() -> Router<Shared> {
         .route("/filtering/set_rules", post(filtering::set_rules))
         .route("/filtering/check_host", get(filtering::check_host))
         .route("/filtering/catalogue", get(filtering::catalogue))
+        // Ours too: what the process is holding, and where.  Nothing in the
+        // web interface asks for it -- it is for watching a container whose
+        // memory climbs, which is how the last two leaks here were found.
+        .route("/debug/memory", get(memory::memory))
         // Safe browsing and parental control.  Not implemented: status reports
         // both as off and every change is refused.  See the safe browsing and
         // parental control section of TASK.md.

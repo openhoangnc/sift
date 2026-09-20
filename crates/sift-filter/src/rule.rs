@@ -187,6 +187,24 @@ const HARD_CEILING: usize = MAX_COMPILED + MAX_COMPILED / 8;
 /// through this, and entries that no longer upgrade are simply skipped.
 static COMPILED: Mutex<VecDeque<Weak<LazyRegex>>> = Mutex::new(VecDeque::new());
 
+/// How many expressions are built right now.
+///
+/// Slots whose rule is gone -- the engine was rebuilt under them -- are not
+/// counted: they leave the next time the ceiling is reached rather than when
+/// the rule drops, so counting them would report a number nothing is holding.
+///
+/// This is the one that used to grow without bound, so it is the one a
+/// memory snapshot is really asking about: against [`MAX_COMPILED`] it says
+/// whether the ceiling is being reached at all.
+pub fn compiled_count() -> usize {
+    COMPILED
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|lr| matches!(&*lr.re.read(), Slot::Built(_)))
+        .count()
+}
+
 impl LazyRegex {
     /// Holds an expression without compiling it.
     pub fn new(src: String) -> Self {
@@ -898,6 +916,20 @@ mod tests {
         assert!(
             held.iter().filter(|r| r.is_built()).count() <= MAX_COMPILED,
             "more expressions are being held than the ceiling allows"
+        );
+        // The number a memory snapshot reports is the same one, counted from
+        // the other side: what the process is holding rather than what this
+        // test happens to be holding.  It is a global, so other tests
+        // building expressions can only add to it -- the ceiling is what it
+        // must respect either way.
+        assert!(
+            compiled_count() <= HARD_CEILING,
+            "the reported count is past even the hard ceiling: {}",
+            compiled_count()
+        );
+        assert!(
+            compiled_count() >= held.iter().filter(|r| r.is_built()).count(),
+            "the reported count misses expressions that are built"
         );
         assert!(
             !held[0].is_built(),

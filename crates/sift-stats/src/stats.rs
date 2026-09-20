@@ -109,6 +109,21 @@ impl StatsResp {
     }
 }
 
+/// What the collector is holding, reported by a memory snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sizes {
+    /// Finished hours held, each capped to the form `stats.db` stores.
+    pub past_hours: usize,
+    /// Distinct names counted in the hour in progress.
+    pub live_domains: usize,
+    /// Distinct blocked names counted in the hour in progress.
+    pub live_blocked_domains: usize,
+    /// Distinct clients counted in the hour in progress.
+    pub live_clients: usize,
+    /// Distinct upstreams counted in the hour in progress.
+    pub live_upstreams: usize,
+}
+
 /// The statistics collector.
 pub struct Stats {
     cfg: Mutex<Config>,
@@ -252,6 +267,26 @@ impl Stats {
         }
 
         out
+    }
+
+    /// What is held in memory, for a memory snapshot.
+    ///
+    /// A finished hour is capped at a hundred names of each kind, so only the
+    /// live hour grows with the traffic, and only until the hour turns.  The
+    /// whole window used to keep every name it had seen -- what the first
+    /// container-memory investigation found -- so these are the numbers that
+    /// say whether that has come back.
+    pub fn sizes(&self) -> Sizes {
+        let inner = self.inner.lock();
+        let live = inner.current.as_ref();
+
+        Sizes {
+            past_hours: inner.past.len(),
+            live_domains: live.map_or(0, |u| u.domains.len()),
+            live_blocked_domains: live.map_or(0, |u| u.blocked_domains.len()),
+            live_clients: live.map_or(0, |u| u.clients.len()),
+            live_upstreams: live.map_or(0, |u| u.upstreams_responses.len()),
+        }
     }
 
     /// Discards units older than the configured window.

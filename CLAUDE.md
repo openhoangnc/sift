@@ -46,7 +46,7 @@ installation.
 | Work dir | `<work>/data/{querylog.json,querylog.json.1,stats.db,sessions.db,filters/,userfilters/}` |
 | Query log | JSON lines, keys `T,QH,QT,QC,CP,IP,Result,Elapsed,Upstream,Answer,…` |
 | Statistics | bbolt file, one bucket per hour named by big-endian `u64`, value a gob `unitDB` under key `[0]` |
-| HTTP API | upstream's 81 paths under `/control/*`, all routed, plus one of ours |
+| HTTP API | upstream's 81 paths under `/control/*`, all routed, plus two of ours |
 | Sessions | `<work>/data/sessions.db`, bucket `sessions-2`, 16-byte token key |
 | Web interface | single-page app served from the embedded filesystem at `/` |
 | Version | **not** part of the contract: this build reports its own, not v0.107.79 |
@@ -57,7 +57,7 @@ installation.
 ```bash
 cargo build --release            # fast to build and to run
 cargo build --profile dist       # fat LTO, panic=abort, stripped: ~10.7 MB
-cargo test --workspace           # 782 tests, no network or Go build needed
+cargo test --workspace           # 788 tests, no network or Go build needed
 cargo clippy --workspace --all-targets
 ```
 
@@ -334,12 +334,26 @@ and the HTTPS fetch in `crates/sift/src/fetch.rs` exist.
 
 ## The web interface
 
-**One path is ours, not upstream's**: `GET /control/filtering/catalogue`
+**Two paths are ours, not upstream's.** `GET /control/filtering/catalogue`
 serves the known-blocklists catalogue that AdGuard Home bundles in its own
 client. Serving it keeps `web/client` free of AdGuard's material, which is what
 `NOTICE.md` claims; the interface falls back to the custom-address form if it
 ever answers 404. Adding a path is safe for the drop-in contract because the
 two builds never serve the same interface.
+
+`GET /control/debug/memory` is the other, and nothing in the web interface asks
+for it. It reports the resident size, the high-water mark and the cgroup's own
+numbers, then a count for every structure in the process that has ever grown
+here — the compiled expressions against their ceiling, the cache's entries
+against its eviction slots, the live hour's names apart from the finished
+hours', the runtime client table, the per-address tables. Both leaks recorded
+in `TASK.md` were found by watching a container and reasoning about which
+structure the climb belonged to; this is that evidence, gathered directly.
+`scripts/memwatch.py` polls it and prints what moved between the first sample
+and the last, so a subsystem that grew is named rather than guessed at. It
+reports counts rather than estimated bytes, because only the response cache
+knows its own size, and a count standing still while the resident size climbs
+is just as much of an answer.
 
 **Two response fields are ours too**: `/control/version.json` carries
 `check_failed` and `autoupdate_blocked_by`, so the interface can tell "up to

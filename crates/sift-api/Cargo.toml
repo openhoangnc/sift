@@ -47,6 +47,7 @@ brotli-decompressor = { version = "6.0.0", default-features = false, features = 
 
 [dev-dependencies]
 sift-config = { path = "../sift-config" }
+tower = "0.5.3"
 rcgen = "0.14.10"
 rustls-pemfile = "2.2.0"
 sift-dns = { path = "../sift-dns" }

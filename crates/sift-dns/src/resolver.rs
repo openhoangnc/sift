@@ -436,6 +436,11 @@ impl Resolver {
         self.engine.read().clone()
     }
 
+    /// How many identical requests are being coalesced right now.
+    pub fn inflight(&self) -> usize {
+        self.pending.len()
+    }
+
     /// A snapshot of the persistent client registry.
     pub fn clients(&self) -> Arc<Registry> {
         self.clients.read().clone()
