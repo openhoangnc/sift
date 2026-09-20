@@ -30,7 +30,7 @@ Verification claims below are reproducible with `scripts/verify.sh` and
 | Operations | logging, rotation, pidfile, privileges, service install |
 | Installer | `scripts/install.sh`: installs, upgrades, and takes over AdGuard Home |
 | Self-update | done — `POST /control/update` replaces the binary and restarts |
-| Version reported | this project's own, from the workspace version — v0.8.0 |
+| Version reported | this project's own, from the workspace version — v0.9.0 |
 
 ---
 
