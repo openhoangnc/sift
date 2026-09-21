@@ -1474,14 +1474,36 @@ work directory doing the same refresh, `VmHWM` and nothing else.
   `rule::drop_compiled()` lets them go before the new engine is built rather
   than after. Worth 25 KB per expression against a ceiling of 2,000.
 
+- **The domain index was built by growing into a table.** It grew from 1,024
+  slots by doubling, reinserting while the old tables were live, and gave
+  every repeated domain a `Vec` of its own — about 500,000 of them. It sorts
+  the pairs and fills a table sized once instead. The sort has to be stable,
+  which costs a scratch buffer of half the input and is why this one is worth
+  3 MB rather than the 40 it looked like.
+- **`NetworkRule` went from 40 bytes to 24.** The pattern was an enum whose
+  `Arc` niche was spent by two payloadless variants, so it cost 16 bytes where
+  a pointer and three bits do; and every rule carried an `i64` list identifier
+  to say one of 37 things, which belongs to the source it was parsed from.
+  2.07M rules make that 33 MB of engine, and a rebuild holds two.
+
 | | v0.9.0 | now |
 |---|---:|---:|
-| loaded, settled | 284.2 MB | 277.7 MB |
-| peak loading | 413.9 MB | **335.6 MB** |
-| peak during a refresh, 349 expressions warm | 675.9 MB | **589.8 MB** |
+| loaded, settled | 284.2 MB | **243.9 MB** |
+| peak loading | 413.9 MB | **300.1 MB** |
+| peak during a refresh of 10 of 37 lists | 662.4 MB | **519.0 MB** |
 
-19% off the load peak and 13% off the refresh peak, the verdicts unchanged —
-the differential test against Go's answers for 4,190 domains covers that.
+27% off the load peak and 22% off the refresh peak, 40 MB off the steady size,
+and the verdicts unchanged — the differential test against Go's answers for
+4,190 domains covers that, and `sizes.rs` now fails if a rule grows past 24
+bytes. Each step was measured in the image against the commit before it, not
+against v0.9.0, so the numbers add up rather than overlapping:
+
+| change | load peak | refresh peak |
+|---|---:|---:|
+| shortcut map sized from the windows there are | −58 MB | −71 MB |
+| compiled expressions released before the rebuild | — | −11 MB (at 349 held) |
+| domain index built by sorting | −2 MB | −3 MB |
+| `NetworkRule` 40 bytes to 24 | −33 MB | −66 MB |
 
 ### A claim in the last round was wrong: musl does not copy a growing vector
 

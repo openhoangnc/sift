@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use sift_filter::rule::{MIN_SHORTCUT_LEN, Pattern, Rule, parse};
+use sift_filter::rule::{MIN_SHORTCUT_LEN, PatternRef, Rule, parse};
 use sift_filter::shortcut::ShortcutIndex;
 
 fn main() {
@@ -21,7 +21,7 @@ fn main() {
         let s = std::fs::read_to_string(p).unwrap_or_default();
         for line in s.lines() {
             if let Ok(Rule::Network(n)) = parse(line, i as i64 + 1) {
-                if let (Pattern::Rx { .. }, Some(sc)) = (&n.rule.pattern, &n.shortcut)
+                if let (PatternRef::Rx { .. }, Some(sc)) = (n.rule.pattern(), &n.shortcut)
                     && sc.len() >= MIN_SHORTCUT_LEN
                 {
                     shortcuts.entry(sc.clone()).or_default().push(idx);

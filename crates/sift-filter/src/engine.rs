@@ -22,7 +22,7 @@ use ahash::{AHashMap, AHashSet};
 use crate::domidx::DomainIndex;
 use crate::pattern::Target;
 use crate::rule::{
-    DnsRewrite, HostRule, MIN_SHORTCUT_LEN, NetworkRule, Options, Pattern, Rule, parse,
+    DnsRewrite, HostRule, MIN_SHORTCUT_LEN, NetworkRule, Options, PatternRef, Rule, parse,
 };
 use crate::shortcut::ShortcutIndex;
 
@@ -135,6 +135,12 @@ pub struct RuleSet {
     /// them rather than copied: the manager keeps every list in memory to
     /// rebuild from, so an arena here held a second copy of the same bytes.
     sources: Vec<Arc<str>>,
+    /// The list identifier each source came from, parallel to `sources`.
+    ///
+    /// Here rather than on the rule: there are 37 of these on a real
+    /// installation and 2.2M rules, and an `i64` on every rule was 17 MB to
+    /// say one of 37 things.
+    list_ids: Vec<i64>,
     /// Where each network rule's text sits within its source.
     net_text: Vec<TextRef>,
     hosts: Vec<HostRule>,
@@ -275,6 +281,15 @@ impl RuleSet {
     }
 
     /// One network rule's original text, from the list it was read from.
+    /// The list a rule came from, by the source its text sits in.
+    fn list_of(&self, idx: u32) -> i64 {
+        self.net_text
+            .get(idx as usize)
+            .and_then(|r| self.list_ids.get(r.src as usize))
+            .copied()
+            .unwrap_or_default()
+    }
+
     fn text_of(&self, idx: u32) -> &str {
         let Some(r) = self.net_text.get(idx as usize) else {
             return "";
@@ -430,12 +445,12 @@ impl RuleSet {
 
     /// Reports whether the rule's pattern matches the request.
     fn pattern_matches(&self, r: &NetworkRule, req: &Request<'_>, url: &str) -> bool {
-        match &r.pattern {
-            Pattern::Any => true,
+        match r.pattern() {
+            PatternRef::Any => true,
             // Reaching a domain-anchored rule means the domain index already
             // matched one of the hostname's suffixes.
-            Pattern::DomainAnchor => true,
-            Pattern::Rx { re, target } => match target {
+            PatternRef::DomainAnchor => true,
+            PatternRef::Rx { re, target } => match target {
                 Target::Url => re.is_match(url),
                 Target::Hostname => re.is_match(req.hostname),
             },
@@ -464,7 +479,7 @@ fn excluded(c: &crate::rule::StrList, req: &Request<'_>) -> bool {
 /// The priority class of a rule.  Upstream's ordering is:
 /// whitelist+important, important, whitelist, then basic rules.
 fn rank(r: &NetworkRule) -> u8 {
-    match (r.allowlist, r.important()) {
+    match (r.allowlist(), r.important()) {
         (true, true) => 3,
         (false, true) => 2,
         (true, false) => 1,
@@ -581,6 +596,7 @@ fn push_ref(map: &mut AHashMap<Box<str>, Refs>, key: Box<str>, idx: u32) {
 struct Builder {
     net: Vec<NetworkRule>,
     sources: Vec<Arc<str>>,
+    list_ids: Vec<i64>,
     net_text: Vec<TextRef>,
     hosts: Vec<HostRule>,
     domain_pairs: Vec<(u64, u32)>,
@@ -596,6 +612,7 @@ impl Builder {
     fn add_list(&mut self, id: i64, text: Arc<str>) {
         let src = self.sources.len() as u16;
         self.sources.push(Arc::clone(&text));
+        self.list_ids.push(id);
 
         let base = text.as_ptr() as usize;
         for line in text.lines() {
@@ -636,14 +653,14 @@ impl Builder {
             src,
         });
 
-        match (&r.pattern, shortcut) {
-            (Pattern::DomainAnchor, Some(d)) => {
+        match (r.pattern(), shortcut) {
+            (PatternRef::DomainAnchor, Some(d)) => {
                 // Hashed here and the string dropped: the index keeps no
                 // keys, so holding one per rule until it was built was 1.9M
                 // live allocations for nothing.
                 self.domain_pairs.push((DomainIndex::hash(&d), idx));
             }
-            (Pattern::Rx { .. }, Some(sc)) if sc.len() >= MIN_SHORTCUT_LEN => {
+            (PatternRef::Rx { .. }, Some(sc)) if sc.len() >= MIN_SHORTCUT_LEN => {
                 self.shortcuts.entry(sc).or_default().push(idx);
             }
             _ => self.scan.push(idx),
@@ -686,6 +703,7 @@ impl Builder {
         let Builder {
             net,
             sources,
+            list_ids,
             net_text,
             hosts,
             domain_pairs,
@@ -699,6 +717,7 @@ impl Builder {
         RuleSet {
             net,
             sources,
+            list_ids,
             net_text,
             hosts,
             domain_index: DomainIndex::build(domain_pairs),
@@ -828,8 +847,12 @@ impl Engine {
             let kept: Vec<(u32, &NetworkRule)> = rewrites
                 .iter()
                 .copied()
-                .filter(|(_, r)| !r.allowlist)
-                .filter(|&(_, r)| !rewrites.iter().any(|&(_, e)| e.allowlist && excepts(e, r)))
+                .filter(|(_, r)| !r.allowlist())
+                .filter(|&(_, r)| {
+                    !rewrites
+                        .iter()
+                        .any(|&(_, e)| e.allowlist() && excepts(e, r))
+                })
                 .filter(|&(_, r)| !rewrites_to_itself(r, req.hostname))
                 .collect();
 
@@ -850,7 +873,7 @@ impl Engine {
 
         // 3. The winning basic rule.
         if let Some((idx, r)) = net {
-            let reason = if r.allowlist {
+            let reason = if r.allowlist() {
                 Reason::NotFilteredAllowList
             } else {
                 Reason::FilteredBlockList
@@ -893,10 +916,10 @@ impl Engine {
 }
 
 /// Converts a network rule into its reportable form.
-fn to_matched(set: &RuleSet, r: &NetworkRule, idx: u32) -> MatchedRule {
+fn to_matched(set: &RuleSet, _r: &NetworkRule, idx: u32) -> MatchedRule {
     MatchedRule {
         text: set.text_of(idx).to_string(),
-        list_id: r.list_id,
+        list_id: set.list_of(idx),
         ip: None,
     }
 }

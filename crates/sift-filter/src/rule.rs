@@ -66,25 +66,111 @@ impl HostRule {
     }
 }
 
+/// What a rule matches against, borrowed from the rule.
+///
+/// The stored form is a pointer and a byte of flags; this is that unpacked
+/// into the shape the matcher wants. See [`NetworkRule`].
+#[derive(Clone, Copy, Debug)]
+pub enum PatternRef<'a> {
+    /// `||domain^`, which reaching through the domain index already proves.
+    DomainAnchor,
+    /// Any other pattern, as an expression built on first use.
+    Rx {
+        /// The expression.
+        re: &'a Arc<LazyRegex>,
+        /// What the expression is matched against.
+        target: Target,
+    },
+    /// Matches every hostname.
+    Any,
+}
+
+/// The pattern is a domain anchor.
+const KIND_ANCHOR: u8 = 0;
+/// The pattern matches everything.
+const KIND_ANY: u8 = 1;
+/// The pattern is an expression.
+const KIND_RX: u8 = 2;
+/// The bits [`KIND_ANCHOR`] and its siblings occupy.
+const KIND_MASK: u8 = 0b11;
+/// The expression matches the pseudo-URL rather than the bare hostname.
+const TARGET_URL: u8 = 1 << 2;
+/// The rule is an exception (`@@`).
+const ALLOWLIST: u8 = 1 << 3;
+
 /// An adblock-style rule.
 ///
-/// The layout is deliberately tight.  A real blocklist holds ~180,000 of
-/// these, so every byte here is multiplied by that: the modifiers live behind
-/// a `Box` because almost no rule has any, and the domain-anchor pattern
-/// carries no payload because reaching it already proves the match.
+/// The layout is deliberately tight.  A real installation holds a couple of
+/// million of these, so every byte here is multiplied by that, and the
+/// rebuild holds two sets of them at once.  Three things follow from that and
+/// look odd until it is said:
+///
+/// * the modifiers live behind a `Box`, because almost no rule has any;
+/// * the pattern is a pointer and three bits rather than an enum. As an enum
+///   it cost 16 bytes: the `Arc` is 8, its niche is spent by the two payloadless
+///   variants, and the target and tag then round the whole thing up. Unpacked
+///   through [`Self::pattern`] it costs a byte;
+/// * the list a rule came from is **not** here. It is a property of the
+///   source the rule was parsed from, one per list, and the rule set holds it
+///   there -- 8 bytes a rule for something with 37 distinct values.
+///
+/// Together those are 40 bytes down to 24, which is 33 MB of a 2.2M-rule
+/// engine and twice that off the rebuild's peak.
 #[derive(Clone, Debug)]
 pub struct NetworkRule {
-    /// The pattern to match.
-    pub pattern: Pattern,
+    /// The expression, for a pattern that needs one.
+    re: Option<Arc<LazyRegex>>,
     /// The modifiers attached to the rule, if it has any.
     pub opts: Option<Box<Options>>,
-    /// The list this rule came from.
-    pub list_id: i64,
-    /// Whether this is an exception (`@@`) rule.
-    pub allowlist: bool,
+    /// The pattern's kind and target, and whether the rule is an exception.
+    flags: u8,
 }
 
 impl NetworkRule {
+    /// Builds a rule from the parts the parser produces.
+    pub fn new(pattern: Pattern, opts: Option<Box<Options>>, allowlist: bool) -> Self {
+        let (re, mut flags) = match pattern {
+            Pattern::DomainAnchor => (None, KIND_ANCHOR),
+            Pattern::Any => (None, KIND_ANY),
+            Pattern::Rx { re, target } => (
+                Some(re),
+                KIND_RX
+                    | match target {
+                        Target::Url => TARGET_URL,
+                        Target::Hostname => 0,
+                    },
+            ),
+        };
+
+        if allowlist {
+            flags |= ALLOWLIST;
+        }
+
+        Self { re, opts, flags }
+    }
+
+    /// What the rule matches against.
+    pub fn pattern(&self) -> PatternRef<'_> {
+        match self.flags & KIND_MASK {
+            KIND_ANCHOR => PatternRef::DomainAnchor,
+            KIND_ANY => PatternRef::Any,
+            _ => PatternRef::Rx {
+                // `KIND_RX` is only ever set beside an expression.
+                re: self.re.as_ref().expect("an expression rule carries one"),
+                target: if self.flags & TARGET_URL == 0 {
+                    Target::Hostname
+                } else {
+                    Target::Url
+                },
+            },
+        }
+    }
+
+    /// Whether this is an exception (`@@`) rule.
+    pub fn allowlist(&self) -> bool {
+        self.flags & ALLOWLIST != 0
+    }
+
     /// The rule's modifiers, if it carries any.
     pub fn opts(&self) -> Option<&Options> {
         self.opts.as_deref()
@@ -555,7 +641,7 @@ pub fn parse(line: &str, list_id: i64) -> Result<Rule, ParseError> {
         return Ok(Rule::Host(h));
     }
 
-    parse_network_rule(t, list_id).map(|r| Rule::Network(Box::new(r)))
+    parse_network_rule(t).map(|r| Rule::Network(Box::new(r)))
 }
 
 /// Parses a hosts-file line, returning `None` if it is not one.
@@ -586,7 +672,7 @@ fn parse_host_rule(t: &str, list_id: i64) -> Option<HostRule> {
 }
 
 /// Parses an adblock-style rule.
-fn parse_network_rule(t: &str, list_id: i64) -> Result<ParsedNetwork, ParseError> {
+fn parse_network_rule(t: &str) -> Result<ParsedNetwork, ParseError> {
     let mut s = t;
     let mut allowlist = false;
     if let Some(rest) = s.strip_prefix("@@") {
@@ -609,12 +695,7 @@ fn parse_network_rule(t: &str, list_id: i64) -> Result<ParsedNetwork, ParseError
     };
 
     Ok(ParsedNetwork {
-        rule: NetworkRule {
-            list_id,
-            allowlist,
-            pattern,
-            opts,
-        },
+        rule: NetworkRule::new(pattern, opts, allowlist),
         shortcut,
     })
 }
@@ -912,7 +993,7 @@ mod tests {
         let Ok(Rule::Network(n)) = parse("/ads/banner", 1) else {
             panic!("expected a network rule");
         };
-        let Pattern::Rx { re, .. } = &n.rule.pattern else {
+        let PatternRef::Rx { re, .. } = n.rule.pattern() else {
             panic!("expected an expression pattern");
         };
 
@@ -998,7 +1079,7 @@ mod tests {
         let Ok(Rule::Network(n)) = parse("/^ads?\\./", 1) else {
             panic!("expected a network rule");
         };
-        let Pattern::Rx { re, .. } = &n.rule.pattern else {
+        let PatternRef::Rx { re, .. } = n.rule.pattern() else {
             panic!("expected an expression pattern");
         };
         assert!(re.is_built(), "a handwritten regex compiles at load");
@@ -1054,7 +1135,7 @@ mod tests {
                 panic!("{rule} should be a network rule");
             };
             assert!(
-                matches!(n.rule.pattern, Pattern::DomainAnchor),
+                matches!(n.rule.pattern(), PatternRef::DomainAnchor),
                 "{rule} should use the fast path"
             );
             // The domain becomes the index key.
@@ -1070,7 +1151,7 @@ mod tests {
             "|http://example.org",
         ] {
             assert!(
-                matches!(net(rule).pattern, Pattern::Rx { .. }),
+                matches!(net(rule).pattern(), PatternRef::Rx { .. }),
                 "{rule} should compile to a regex"
             );
         }
@@ -1079,17 +1160,20 @@ mod tests {
     #[test]
     fn a_domain_anchor_without_a_separator_is_not_the_fast_path() {
         // `||example.org` is a prefix match, so it must not use the suffix walk.
-        assert!(matches!(net("||example.org").pattern, Pattern::Rx { .. }));
         assert!(matches!(
-            net("||example.org^").pattern,
-            Pattern::DomainAnchor
+            net("||example.org").pattern(),
+            PatternRef::Rx { .. }
+        ));
+        assert!(matches!(
+            net("||example.org^").pattern(),
+            PatternRef::DomainAnchor
         ));
     }
 
     #[test]
     fn parses_allowlist_marker() {
-        assert!(net("@@||example.org^").allowlist);
-        assert!(!net("||example.org^").allowlist);
+        assert!(net("@@||example.org^").allowlist());
+        assert!(!net("||example.org^").allowlist());
     }
 
     #[test]
@@ -1155,7 +1239,7 @@ mod tests {
 
     #[test]
     fn parses_regex_rules() {
-        assert!(matches!(net("/^ads?\\./").pattern, Pattern::Rx { .. }));
+        assert!(matches!(net("/^ads?\\./").pattern(), PatternRef::Rx { .. }));
         assert!(parse("/[unclosed/", 1).is_err());
     }
 

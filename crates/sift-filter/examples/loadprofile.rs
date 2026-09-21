@@ -5,7 +5,7 @@
 use std::time::Instant;
 
 use sift_filter::engine::Engine;
-use sift_filter::rule::{MIN_SHORTCUT_LEN, Pattern, Rule, parse};
+use sift_filter::rule::{MIN_SHORTCUT_LEN, PatternRef, Rule, parse};
 
 /// Resident set size in MB.
 fn rss_mb() -> f64 {
@@ -69,9 +69,9 @@ fn main() {
             match parse(line, *id) {
                 Ok(Rule::Network(n)) => {
                     net += 1;
-                    match (&n.rule.pattern, &n.shortcut) {
-                        (Pattern::DomainAnchor, Some(_)) => anchors += 1,
-                        (Pattern::Rx { .. }, Some(sc)) if sc.len() >= MIN_SHORTCUT_LEN => {
+                    match (n.rule.pattern(), &n.shortcut) {
+                        (PatternRef::DomainAnchor, Some(_)) => anchors += 1,
+                        (PatternRef::Rx { .. }, Some(sc)) if sc.len() >= MIN_SHORTCUT_LEN => {
                             shortcuts += 1;
                         }
                         _ => scans += 1,
