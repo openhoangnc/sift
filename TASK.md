@@ -1507,13 +1507,28 @@ work directory doing the same refresh, `VmHWM` and nothing else.
   stops generating it at all for the wildcard forms, which is 156,000
   `to_regex` calls off the load.
 
+- **A rebuild parsed every list again, including the ones that had not
+  changed.** The rules of one list are now a *segment* held by `Arc`, and the
+  engine being built shares the segments of the one still serving wherever
+  the list's text is the same `Arc` — which is exactly what `apply_fetched`
+  leaves alone when a download matches what is on disk. A refresh that
+  changes ten of 37 lists parses ten.
+
+  Rules are referred to by a packed `(segment, position)` number, 8 bits and
+  23. The segment is the high part deliberately: a priority tie is settled by
+  the earlier rule, which upstream defines as the order the lists were read
+  and then the order within the list, so comparing packed references
+  numerically is comparing exactly that and `higher_priority` did not change.
+  The `$badfilter` set stays one set over all segments, because such a rule
+  cancels a rule in another list as readily as one in its own.
+
 | | v0.9.0 | now |
 |---|---:|---:|
-| loaded, settled | 284.2 MB | **195.5 MB** |
-| peak loading | 413.9 MB | **256.5 MB** |
-| peak during a refresh of 10 of 37 lists | 662.4 MB | **432.7 MB** |
+| loaded, settled | 284.2 MB | **193.5 MB** |
+| peak loading | 413.9 MB | **257.0 MB** |
+| peak during a refresh of 10 of 37 lists | 662.4 MB | **324.9 MB** |
 
-38% off the load peak and 35% off the refresh peak, 89 MB off the steady size,
+38% off the load peak and **51% off the refresh peak**, 91 MB off the steady size,
 and the verdicts unchanged — the differential test against Go's answers for
 4,190 domains covers that, and `sizes.rs` now fails if a rule grows past 24
 bytes. Each step was measured in the image against the commit before it, not
@@ -1527,6 +1542,7 @@ against v0.9.0, so the numbers add up rather than overlapping:
 | `NetworkRule` 40 bytes to 24 | −33 MB | −66 MB |
 | host rules without their duplicate names, half-width index hashes | −35 MB | −70 MB |
 | expressions without their stored source | −9 MB | −18 MB |
+| segments carried over from the engine being replaced | — | −79 MB |
 
 The engine's own estimate of itself falls from 192.0 MB to 123.0 MB over
 those, which is the number the peak is twice.

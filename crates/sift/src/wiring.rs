@@ -405,7 +405,10 @@ impl Reloader for LiveReloader {
         // inside its peak for nothing.
         sift_filter::rule::drop_compiled();
 
-        self.resolver.set_engine(filters.build_engine());
+        // Built from the engine being replaced, so the lists this refresh
+        // did not change are carried over rather than parsed again.
+        self.resolver
+            .set_engine(filters.build_engine_with(&self.resolver.engine()));
         self.resolver.set_services(filters.build_services_engine());
     }
 }

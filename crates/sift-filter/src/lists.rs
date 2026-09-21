@@ -222,6 +222,20 @@ impl Manager {
     /// The blocked services are **not** included; they get their own engine,
     /// because the schedule decides per request whether they apply.
     pub fn build_engine(&self) -> Engine {
+        self.build_engine_from(None)
+    }
+
+    /// Builds the engine, carrying over the lists `previous` already parsed.
+    ///
+    /// What a refresh is for: it replaces a list's text only when the bytes
+    /// differ, so the lists it left alone are the same `Arc` and their rules
+    /// are shared with the engine still serving rather than parsed and
+    /// allocated a second time.
+    pub fn build_engine_with(&self, previous: &Engine) -> Engine {
+        self.build_engine_from(Some(previous))
+    }
+
+    fn build_engine_from(&self, previous: Option<&Engine>) -> Engine {
         let user_text = self.user_rules.join("\n");
 
         // The lists are handed over by `Arc`, so the engine's rules point at
@@ -247,7 +261,10 @@ impl Manager {
             .map(|l| (l.id, Arc::clone(&l.text)))
             .collect();
 
-        Engine::build(block, allow)
+        match previous {
+            Some(p) => p.rebuild(block, allow),
+            None => Engine::build(block, allow),
+        }
     }
 
     /// The total number of rules across enabled lists.

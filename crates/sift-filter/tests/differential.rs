@@ -42,6 +42,49 @@ fn go_truth() -> Vec<(String, String, String)> {
 }
 
 #[test]
+fn the_same_rules_split_across_lists_answer_the_same_way() {
+    // Rules are stored per list and referred to by a packed (list, position)
+    // number, so the split is observable in the arithmetic that settles a
+    // priority tie: the earlier list must win, exactly as the earlier line
+    // does within one list. Splitting the real 179,334-rule filter into 64
+    // lists and asking the same 4,190 domains is the test of that -- the
+    // verdicts and the cited rules must not move.
+    let list = filter_list();
+    let one = Engine::build([(1i64, list.as_str())], sift_filter::engine::NO_LISTS);
+
+    let lines: Vec<&str> = list.lines().collect();
+    let per = lines.len().div_ceil(64);
+    let chunks: Vec<(i64, String)> = lines
+        .chunks(per)
+        .enumerate()
+        .map(|(i, c)| (i as i64 + 1, c.join("\n")))
+        .collect();
+    let many = Engine::build(chunks, sift_filter::engine::NO_LISTS);
+
+    assert_eq!(one.len(), many.len(), "the same rules, differently grouped");
+
+    for (dom, _, _) in go_truth() {
+        let a = one.match_request(&Request {
+            hostname: &dom,
+            qtype: 1,
+            ..Default::default()
+        });
+        let b = many.match_request(&Request {
+            hostname: &dom,
+            qtype: 1,
+            ..Default::default()
+        });
+
+        assert_eq!(a.reason, b.reason, "{dom}");
+        assert_eq!(
+            a.rules.iter().map(|r| &r.text).collect::<Vec<_>>(),
+            b.rules.iter().map(|r| &r.text).collect::<Vec<_>>(),
+            "{dom}: cited rules differ"
+        );
+    }
+}
+
+#[test]
 fn matches_the_go_engine_on_the_real_adguard_dns_filter() {
     let list = filter_list();
     let engine = Engine::build([(1i64, list.as_str())], sift_filter::engine::NO_LISTS);

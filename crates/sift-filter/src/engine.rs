@@ -38,18 +38,121 @@ type Candidate<'a> = (u32, &'a NetworkRule);
 
 /// A rule's text, as a slice of the list it was read from.
 ///
-/// Eight bytes, and no bytes of its own: the text is the line still sitting in
-/// the source the rule was parsed from. Which source is not stored per rule —
-/// rules are added list by list, so `src_starts` recovers it.
+/// No bytes of its own: the text is the line still sitting in the segment's
+/// source. Which source is not stored, because a segment has exactly one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct TextRef {
-    /// Byte offset into the source.
+    /// Byte offset into the segment's source.
     off: u32,
     /// Length in bytes. A line longer than this can hold is not a rule
     /// anyone wrote; such a rule still matches, it just reports no text.
     len: u16,
-    /// Which source, indexing `RuleSet::sources`.
-    src: u16,
+}
+
+/// How many bits of a rule reference name the rule within its segment.
+const LOCAL_BITS: u32 = 23;
+
+/// The part of a rule reference that names the rule within its segment.
+const LOCAL_MASK: u32 = (1 << LOCAL_BITS) - 1;
+
+/// The most rules one list may contribute.
+const MAX_LOCAL: usize = LOCAL_MASK as usize;
+
+/// The most lists one set may hold.
+///
+/// A reference has 31 bits, because both indexes reserve bit 31 to mark a
+/// spill offset. The largest subscribed list anyone publishes is around two
+/// million rules, so the split gives the per-list half the headroom.
+const MAX_SEGMENTS: usize = 1 << (31 - LOCAL_BITS);
+
+/// A reference to a rule: which segment it is in, and where.
+///
+/// The segment is the high part deliberately. Priority ties are settled by
+/// the *earlier* rule, which upstream defines as the order the lists were
+/// read and then the order within the list -- so comparing packed references
+/// numerically is comparing exactly that, and `higher_priority` needs to know
+/// nothing about segments.
+const fn pack(seg: usize, local: usize) -> u32 {
+    ((seg as u32) << LOCAL_BITS) | (local as u32)
+}
+
+/// Which segment a reference names.
+const fn seg_of(idx: u32) -> usize {
+    (idx >> LOCAL_BITS) as usize
+}
+
+/// Where in its segment a reference names.
+const fn local_of(idx: u32) -> usize {
+    (idx & LOCAL_MASK) as usize
+}
+
+/// One list's rules, as parsed.
+///
+/// Held by `Arc` so the engine being built can share the segments of the one
+/// still serving: a refresh changes a handful of lists and leaves the rest
+/// byte for byte the same, and parsing those again produced a second copy of
+/// rules identical to the ones already in memory. Carried over instead, they
+/// cost a pointer -- and keep the expressions they have already compiled.
+#[derive(Default)]
+struct Segment {
+    /// The list this came from.
+    list_id: i64,
+    /// The text the rules point into.
+    source: Arc<str>,
+    /// The rules, in file order.
+    net: Vec<NetworkRule>,
+    /// Where each rule's text sits in `source`.
+    net_text: Vec<TextRef>,
+    /// Hosts-file entries, in file order.
+    hosts: Vec<HostRule>,
+    /// The canonical text of this list's `$badfilter` rules.
+    badfilter: Vec<Box<str>>,
+    /// Rules of both kinds, as `len` counts them.
+    rules_count: usize,
+}
+
+impl Segment {
+    /// The text of one of this segment's rules.
+    fn text(&self, local: usize) -> &str {
+        let Some(r) = self.net_text.get(local) else {
+            return "";
+        };
+
+        self.source
+            .get(r.off as usize..r.off as usize + r.len as usize)
+            .unwrap_or("")
+    }
+}
+
+/// Where a rule is filed in the global indexes.
+enum Key {
+    /// Under a domain, by hash.
+    Domain(u64),
+    /// Under a substring of its pattern.
+    Shortcut(String),
+    /// Nowhere: it is consulted on every query.
+    Scan,
+}
+
+/// Where a rule belongs in the indexes, from the rule and its text.
+///
+/// Derived here rather than kept on the rule: the parser worked this out
+/// once, and storing it was 12 bytes a rule for something a string scan
+/// recovers. It is the same decision `parse_pattern` made, from the same
+/// text.
+fn index_key(r: &NetworkRule, text: &str) -> Key {
+    let body = text.strip_prefix("@@").unwrap_or(text);
+    let pattern = crate::rule::pattern_part(body);
+
+    match r.pattern() {
+        PatternRef::DomainAnchor => crate::rule::domain_anchor_of(pattern)
+            .map_or(Key::Scan, |d| Key::Domain(DomainIndex::hash(&d))),
+        PatternRef::Rx { .. } => match crate::pattern::shortcut(pattern, MIN_SHORTCUT_LEN) {
+            Some(sc) if sc.len() >= MIN_SHORTCUT_LEN => Key::Shortcut(sc),
+            _ => Key::Scan,
+        },
+        PatternRef::Any => Key::Scan,
+    }
 }
 
 /// The rule indices stored under one index key.
@@ -130,20 +233,9 @@ impl MatchResult {
 /// An indexed set of rules from one group of lists.
 #[derive(Default)]
 pub struct RuleSet {
-    net: Vec<NetworkRule>,
-    /// The list texts the rules were parsed from, shared with whatever owns
-    /// them rather than copied: the manager keeps every list in memory to
-    /// rebuild from, so an arena here held a second copy of the same bytes.
-    sources: Vec<Arc<str>>,
-    /// The list identifier each source came from, parallel to `sources`.
-    ///
-    /// Here rather than on the rule: there are 37 of these on a real
-    /// installation and 2.2M rules, and an `i64` on every rule was 17 MB to
-    /// say one of 37 things.
-    list_ids: Vec<i64>,
-    /// Where each network rule's text sits within its source.
-    net_text: Vec<TextRef>,
-    hosts: Vec<HostRule>,
+    /// One per list, in the order the lists were given, shared with whatever
+    /// engine was built before this one where the list did not change.
+    segments: Vec<Arc<Segment>>,
     domain_index: DomainIndex,
     host_index: AHashMap<Box<str>, Refs>,
     shortcuts: ShortcutIndex,
@@ -162,12 +254,61 @@ impl RuleSet {
     /// set.  Hand it an `Arc<str>` that something else already holds and it
     /// costs nothing; a `&str` is copied once, which is what tests want.
     pub fn build<T: Into<Arc<str>>>(lists: impl IntoIterator<Item = (i64, T)>) -> Self {
-        let mut b = Builder::default();
+        Self::assemble(lists, None)
+    }
+
+    /// Builds a rule set, carrying over the segments of `self` whose list is
+    /// unchanged.
+    ///
+    /// "Unchanged" is `Arc::ptr_eq` on the text: the manager replaces a
+    /// list's `Arc<str>` only when the bytes it downloaded differ, so sharing
+    /// the pointer *is* the test, and it costs nothing. A daily refresh of a
+    /// real installation leaves most lists alone, and those are not parsed
+    /// again, not allocated again, and keep the expressions they have already
+    /// compiled.
+    pub fn rebuild<T: Into<Arc<str>>>(&self, lists: impl IntoIterator<Item = (i64, T)>) -> Self {
+        Self::assemble(lists, Some(self))
+    }
+
+    /// Parses what it must, carries over what it can, and indexes the lot.
+    fn assemble<T: Into<Arc<str>>>(
+        lists: impl IntoIterator<Item = (i64, T)>,
+        previous: Option<&Self>,
+    ) -> Self {
+        let mut segments: Vec<Arc<Segment>> = Vec::new();
+
         for (id, text) in lists {
-            b.add_list(id, text.into());
+            // Past this a reference would not fit in the 31 bits the indexes
+            // leave, so the lists beyond it are not loaded rather than
+            // silently folded into another list's rules.
+            if segments.len() >= MAX_SEGMENTS {
+                break;
+            }
+
+            let text: Arc<str> = text.into();
+            let carried = previous.and_then(|p| {
+                p.segments
+                    .iter()
+                    .find(|s| s.list_id == id && Arc::ptr_eq(&s.source, &text))
+            });
+
+            segments.push(match carried {
+                Some(s) => Arc::clone(s),
+                None => Arc::new(parse_segment(id, text)),
+            });
         }
 
-        b.finish()
+        merge(segments)
+    }
+
+    /// One of the set's rules.
+    fn rule(&self, idx: u32) -> Option<&NetworkRule> {
+        self.segments.get(seg_of(idx))?.net.get(local_of(idx))
+    }
+
+    /// One of the set's host rules.
+    fn host(&self, idx: u32) -> Option<&HostRule> {
+        self.segments.get(seg_of(idx))?.hosts.get(local_of(idx))
     }
 
     /// A rough breakdown of where the set's memory goes.
@@ -177,14 +318,39 @@ impl RuleSet {
     pub fn footprint(&self) -> String {
         use std::mem::size_of;
 
-        let net_structs = self.net.capacity() * size_of::<NetworkRule>();
-        let net_text = self.net_text.capacity() * size_of::<TextRef>()
-            + self.sources.capacity() * size_of::<Arc<str>>();
-        let net_opts =
-            self.net.iter().filter(|r| r.opts.is_some()).count() * (size_of::<Options>() + 32);
+        let net_count: usize = self.segments.iter().map(|s| s.net.len()).sum();
+        let host_count: usize = self.segments.iter().map(|s| s.hosts.len()).sum();
 
-        let host_structs = self.hosts.capacity() * size_of::<HostRule>();
-        let host_text: usize = self.hosts.iter().map(|h| h.text.len() + 32).sum();
+        let net_structs: usize = self
+            .segments
+            .iter()
+            .map(|s| s.net.capacity() * size_of::<NetworkRule>())
+            .sum();
+        let net_text: usize = self
+            .segments
+            .iter()
+            .map(|s| s.net_text.capacity() * size_of::<TextRef>())
+            .sum::<usize>()
+            + self.segments.capacity() * size_of::<Arc<Segment>>();
+        let net_opts: usize = self
+            .segments
+            .iter()
+            .flat_map(|s| s.net.iter())
+            .filter(|r| r.opts.is_some())
+            .count()
+            * (size_of::<Options>() + 32);
+
+        let host_structs: usize = self
+            .segments
+            .iter()
+            .map(|s| s.hosts.capacity() * size_of::<HostRule>())
+            .sum();
+        let host_text: usize = self
+            .segments
+            .iter()
+            .flat_map(|s| s.hosts.iter())
+            .map(|h| h.text.len() + 32)
+            .sum();
 
         let idx = |m: &AHashMap<Box<str>, Refs>| -> (usize, usize, usize) {
             let keys: usize = m.keys().map(|k| k.len() + 32).sum();
@@ -228,14 +394,14 @@ impl RuleSet {
             (
                 "network rule structs",
                 net_structs,
-                format!("{} rules", self.net.len()),
+                format!("{net_count} rules"),
             ),
             ("network rule text", net_text, String::new()),
             ("network rule options", net_opts, String::new()),
             (
                 "host rule structs",
                 host_structs,
-                format!("{} rules", self.hosts.len()),
+                format!("{host_count} rules"),
             ),
             ("host rule text+names", host_text, String::new()),
             (
@@ -272,26 +438,15 @@ impl RuleSet {
     }
 
     /// One network rule's original text, from the list it was read from.
-    /// The list a rule came from, by the source its text sits in.
+    /// The list a rule came from, which is the segment it is in.
     fn list_of(&self, idx: u32) -> i64 {
-        self.net_text
-            .get(idx as usize)
-            .and_then(|r| self.list_ids.get(r.src as usize))
-            .copied()
-            .unwrap_or_default()
+        self.segments.get(seg_of(idx)).map_or(0, |s| s.list_id)
     }
 
     fn text_of(&self, idx: u32) -> &str {
-        let Some(r) = self.net_text.get(idx as usize) else {
-            return "";
-        };
-
-        let Some(text) = self.sources.get(r.src as usize) else {
-            return "";
-        };
-
-        text.get(r.off as usize..r.off as usize + r.len as usize)
-            .unwrap_or("")
+        self.segments
+            .get(seg_of(idx))
+            .map_or("", |s| s.text(local_of(idx)))
     }
 
     /// The number of rules that were loaded.
@@ -358,7 +513,9 @@ impl RuleSet {
         best: &mut Option<(u32, &'r NetworkRule)>,
         rewrites: &mut Vec<(u32, &'r NetworkRule)>,
     ) {
-        let r = &self.net[idx as usize];
+        let Some(r) = self.rule(idx) else {
+            return;
+        };
 
         // `$badfilter` is rare — a real 37-list installation has none at all —
         // and answering it needs the rule's text, which nothing else on this
@@ -469,7 +626,7 @@ impl RuleSet {
     fn match_hosts(&self, req: &Request<'_>) -> Vec<&HostRule> {
         self.host_index
             .get(req.hostname)
-            .map(|ids| ids.iter().map(|i| &self.hosts[i as usize]).collect())
+            .map(|ids| ids.iter().filter_map(|i| self.host(i)).collect())
             .unwrap_or_default()
     }
 }
@@ -600,141 +757,107 @@ fn push_ref(map: &mut AHashMap<Box<str>, Refs>, key: Box<str>, idx: u32) {
 }
 
 /// Accumulates rules and builds the lookup indexes.
-#[derive(Default)]
-struct Builder {
-    net: Vec<NetworkRule>,
-    sources: Vec<Arc<str>>,
-    list_ids: Vec<i64>,
-    net_text: Vec<TextRef>,
-    hosts: Vec<HostRule>,
-    domain_pairs: Vec<(u64, u32)>,
-    host_index: AHashMap<Box<str>, Refs>,
-    shortcuts: AHashMap<String, Vec<u32>>,
-    scan: Vec<u32>,
-    badfilter: AHashSet<Box<str>>,
-    rules_count: usize,
+/// Parses one list into a segment.
+fn parse_segment(list_id: i64, source: Arc<str>) -> Segment {
+    let mut seg = Segment {
+        list_id,
+        source,
+        ..Default::default()
+    };
+
+    let base = seg.source.as_ptr() as usize;
+    // Cloned so the loop can borrow the source while the segment is written.
+    let source = Arc::clone(&seg.source);
+
+    for line in source.lines() {
+        match parse(line, list_id) {
+            Ok(Rule::Network(n)) => {
+                if seg.net.len() >= MAX_LOCAL {
+                    break;
+                }
+
+                // `parse` trims, so this is exactly the text it used, and it
+                // is a slice of the source — hence the offset arithmetic.
+                let t = line.trim();
+                if n.rule.badfilter() {
+                    seg.badfilter
+                        .push(canonical_text(t).into_owned().into_boxed_str());
+                }
+
+                seg.net_text.push(TextRef {
+                    off: (t.as_ptr() as usize - base) as u32,
+                    len: u16::try_from(t.len()).unwrap_or(0),
+                });
+                seg.net.push(n.rule);
+                seg.rules_count += 1;
+            }
+            Ok(Rule::Host(h)) => {
+                if seg.hosts.len() >= MAX_LOCAL {
+                    break;
+                }
+
+                seg.hosts.push(h);
+                seg.rules_count += 1;
+            }
+            Err(_) => {}
+        }
+    }
+
+    seg.net.shrink_to_fit();
+    seg.net_text.shrink_to_fit();
+    seg.hosts.shrink_to_fit();
+
+    seg
 }
 
-impl Builder {
-    /// Parses and indexes every line of one list.
-    fn add_list(&mut self, id: i64, text: Arc<str>) {
-        let src = self.sources.len() as u16;
-        self.sources.push(Arc::clone(&text));
-        self.list_ids.push(id);
+/// Indexes a set of segments into a queryable rule set.
+///
+/// The segments are walked in order and each segment's rules in file order,
+/// so every index is filled in exactly the order a single pass over the
+/// concatenated lists would have filled it — which is the order upstream
+/// considers rules, and the order a tie is settled by.
+fn merge(segments: Vec<Arc<Segment>>) -> RuleSet {
+    let mut domain_pairs: Vec<(u64, u32)> = Vec::new();
+    let mut shortcuts: AHashMap<String, Vec<u32>> = AHashMap::new();
+    let mut scan: Vec<u32> = Vec::new();
+    let mut host_index: AHashMap<Box<str>, Refs> = AHashMap::new();
+    let mut badfilter: AHashSet<Box<str>> = AHashSet::new();
+    let mut rules_count = 0usize;
 
-        let base = text.as_ptr() as usize;
-        for line in text.lines() {
-            match parse(line, id) {
-                Ok(Rule::Network(n)) => {
-                    // `parse` trims, so this is exactly the text it used, and
-                    // it is a slice of `text` — hence the offset arithmetic.
-                    let t = line.trim();
-                    let off = (t.as_ptr() as usize - base) as u32;
-                    self.add_network(n.rule, t, src, off, n.shortcut);
-                }
-                Ok(Rule::Host(h)) => self.add_host(h),
-                Err(_) => {}
+    for (s, seg) in segments.iter().enumerate() {
+        rules_count += seg.rules_count;
+
+        // One set over every segment, because a `$badfilter` rule cancels a
+        // rule in another list as readily as one in its own.
+        badfilter.extend(seg.badfilter.iter().cloned());
+
+        for (local, r) in seg.net.iter().enumerate() {
+            let idx = pack(s, local);
+            match index_key(r, seg.text(local)) {
+                Key::Domain(h) => domain_pairs.push((h, idx)),
+                Key::Shortcut(sc) => shortcuts.entry(sc).or_default().push(idx),
+                Key::Scan => scan.push(idx),
+            }
+        }
+
+        for (local, h) in seg.hosts.iter().enumerate() {
+            let idx = pack(s, local);
+            for name in h.hostnames() {
+                push_ref(&mut host_index, name.into_boxed_str(), idx);
             }
         }
     }
 
-    /// Indexes one network rule.
-    fn add_network(
-        &mut self,
-        r: NetworkRule,
-        text: &str,
-        src: u16,
-        off: u32,
-        shortcut: Option<String>,
-    ) {
-        self.rules_count += 1;
+    scan.shrink_to_fit();
 
-        if r.badfilter() {
-            self.badfilter
-                .insert(canonical_text(text).into_owned().into_boxed_str());
-        }
-
-        let idx = self.net.len() as u32;
-        self.net_text.push(TextRef {
-            off,
-            len: u16::try_from(text.len()).unwrap_or(0),
-            src,
-        });
-
-        match (r.pattern(), shortcut) {
-            (PatternRef::DomainAnchor, Some(d)) => {
-                // Hashed here and the string dropped: the index keeps no
-                // keys, so holding one per rule until it was built was 1.9M
-                // live allocations for nothing.
-                self.domain_pairs.push((DomainIndex::hash(&d), idx));
-            }
-            (PatternRef::Rx { .. }, Some(sc)) if sc.len() >= MIN_SHORTCUT_LEN => {
-                self.shortcuts.entry(sc).or_default().push(idx);
-            }
-            _ => self.scan.push(idx),
-        }
-
-        self.net.push(r);
-    }
-
-    /// Indexes one hosts-file rule.
-    fn add_host(&mut self, h: HostRule) {
-        self.rules_count += 1;
-        let idx = self.hosts.len() as u32;
-        for name in h.hostnames() {
-            push_ref(&mut self.host_index, name.into_boxed_str(), idx);
-        }
-        self.hosts.push(h);
-    }
-
-    /// Finalises the indexes into a queryable rule set.
-    fn finish(mut self) -> RuleSet {
-        // A `Vec` grows by doubling, so each of these can be holding up to
-        // twice what it needs. They are written once and read for the life of
-        // the process, so hand the overshoot back.
-        //
-        // This is free on the shipping target and worth having elsewhere.
-        // Rust's `System` allocator reallocates through libc, and musl's
-        // `mallocng` serves anything past 128 KB from `mmap` and resizes it
-        // with `mremap`: growing moves page tables rather than copying, and
-        // shrinking truncates in place and returns the pages at once. A
-        // conditional version of this was tried on the theory that shrinking
-        // an 83 MB vector cost an 83 MB copy inside the rebuild's peak. It
-        // does not, on musl -- measured with a 160 MB vector in the image:
-        // growing it left `VmHWM` where it was, and shrinking it did too.
-        self.net.shrink_to_fit();
-        self.net_text.shrink_to_fit();
-        self.hosts.shrink_to_fit();
-        self.scan.shrink_to_fit();
-        self.domain_pairs.shrink_to_fit();
-
-        let Builder {
-            net,
-            sources,
-            list_ids,
-            net_text,
-            hosts,
-            domain_pairs,
-            host_index,
-            shortcuts,
-            scan,
-            badfilter,
-            rules_count,
-        } = self;
-
-        RuleSet {
-            net,
-            sources,
-            list_ids,
-            net_text,
-            hosts,
-            domain_index: DomainIndex::build(domain_pairs),
-            host_index,
-            shortcuts: ShortcutIndex::build(shortcuts.into_iter().collect()),
-            scan,
-            badfilter,
-            rules_count,
-        }
+    RuleSet {
+        segments,
+        domain_index: DomainIndex::build(domain_pairs),
+        host_index,
+        shortcuts: ShortcutIndex::build(shortcuts.into_iter().collect()),
+        scan,
+        badfilter,
+        rules_count,
     }
 }
 
@@ -805,6 +928,23 @@ impl Engine {
         Self {
             allow: RuleSet::build(allow),
             block: RuleSet::build(block),
+        }
+    }
+
+    /// Builds an engine, carrying over what `self` already parsed.
+    ///
+    /// A list whose text is the same `Arc` is not parsed or allocated again;
+    /// see [`RuleSet::rebuild`]. The result is the engine [`Self::build`]
+    /// would have produced from the same lists --
+    /// `a_rebuilt_engine_answers_exactly_as_a_fresh_one` holds it to that.
+    pub fn rebuild<T: Into<Arc<str>>, U: Into<Arc<str>>>(
+        &self,
+        block: impl IntoIterator<Item = (i64, T)>,
+        allow: impl IntoIterator<Item = (i64, U)>,
+    ) -> Self {
+        Self {
+            allow: self.allow.rebuild(allow),
+            block: self.block.rebuild(block),
         }
     }
 
@@ -963,6 +1103,104 @@ mod tests {
 
     fn matches(e: &Engine, host: &str) -> MatchResult {
         e.match_request(&req(host, A))
+    }
+
+    #[test]
+    fn a_rebuilt_engine_answers_exactly_as_a_fresh_one() {
+        // The whole point of carrying segments over is that the result is
+        // indistinguishable from parsing everything again. This changes some
+        // lists and not others, across the shapes where a carried-over
+        // segment could go wrong: a tie settled by list order, an exception
+        // in one list against a block in another, `$important` across lists,
+        // a `$badfilter` in one list cancelling a rule in another, host
+        // rules for one name in two lists, and a rewrite.
+        let v1: Vec<(i64, Arc<str>)> = vec![
+            (
+                1,
+                Arc::from("||tie.example^\n||only-a.example^\n0.0.0.0 host.example\n"),
+            ),
+            (
+                2,
+                Arc::from("||tie.example^\n@@||allowed.example^\n||allowed.example^\n"),
+            ),
+            (
+                3,
+                Arc::from("||imp.example^$important\n@@||imp.example^\n::1 host.example\n"),
+            ),
+            (
+                4,
+                Arc::from("||bad.example^\n||rw.example^$dnsrewrite=1.2.3.4\n"),
+            ),
+            (5, Arc::from("||bad.example^$badfilter\n")),
+        ];
+
+        // A second version of lists 2 and 4; 1, 3 and 5 keep their `Arc` and
+        // so are the ones carried over.
+        let mut v2 = v1.clone();
+        v2[1].1 = Arc::from("||tie.example^\n@@||allowed.example^\n||added.example^\n");
+        v2[3].1 = Arc::from("||bad.example^\n||rw.example^$dnsrewrite=5.6.7.8\n");
+
+        let first = Engine::build(v1, NO_LISTS);
+        let rebuilt = first.rebuild(v2.clone(), NO_LISTS);
+        let fresh = Engine::build(v2, NO_LISTS);
+
+        // The carried-over segments really were carried over, or this test
+        // proves nothing about reuse.
+        assert!(
+            Arc::ptr_eq(&first.block.segments[0], &rebuilt.block.segments[0]),
+            "an unchanged list should be the same segment"
+        );
+        assert!(
+            !Arc::ptr_eq(&first.block.segments[1], &rebuilt.block.segments[1]),
+            "a changed list should be parsed again"
+        );
+
+        assert_eq!(rebuilt.len(), fresh.len());
+        for host in [
+            "tie.example",
+            "only-a.example",
+            "allowed.example",
+            "added.example",
+            "imp.example",
+            "bad.example",
+            "rw.example",
+            "host.example",
+            "nothing.example",
+        ] {
+            for qtype in [A, AAAA] {
+                let a = rebuilt.match_request(&req(host, qtype));
+                let b = fresh.match_request(&req(host, qtype));
+
+                assert_eq!(a.reason, b.reason, "{host} {qtype}");
+                assert_eq!(
+                    a.rules.iter().map(|r| &r.text).collect::<Vec<_>>(),
+                    b.rules.iter().map(|r| &r.text).collect::<Vec<_>>(),
+                    "{host} {qtype}: cited rules differ"
+                );
+                assert_eq!(
+                    a.rules.iter().map(|r| r.list_id).collect::<Vec<_>>(),
+                    b.rules.iter().map(|r| r.list_id).collect::<Vec<_>>(),
+                    "{host} {qtype}: cited lists differ"
+                );
+                assert_eq!(a.rewrites, b.rewrites, "{host} {qtype}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_rule_reference_carries_its_segment_and_stays_under_the_spill_bit() {
+        // Both indexes reserve bit 31 of a value, so a reference has 31 to
+        // work with. The split has to leave the high part above the low one,
+        // because comparing packed references numerically is how a priority
+        // tie is settled by the earlier list.
+        assert_eq!(pack(0, 0), 0);
+        assert_eq!(seg_of(pack(37, 12_345)), 37);
+        assert_eq!(local_of(pack(37, 12_345)), 12_345);
+        assert!(pack(MAX_SEGMENTS - 1, MAX_LOCAL) < 1 << 31);
+        assert!(
+            pack(1, 0) > pack(0, MAX_LOCAL),
+            "an earlier list sorts first"
+        );
     }
 
     #[test]

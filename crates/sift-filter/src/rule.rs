@@ -986,7 +986,7 @@ fn parse_pattern(s: &str) -> Result<(Pattern, Option<String>), ParseError> {
 /// The trailing `^` is required: without it the pattern is a prefix match
 /// (`||example.org` also matches `example.org.evil.com`), which a suffix walk
 /// would get wrong.
-fn domain_anchor_of(s: &str) -> Option<String> {
+pub(crate) fn domain_anchor_of(s: &str) -> Option<String> {
     let body = s.strip_prefix("||")?;
     let dom = body.strip_suffix('^')?;
 
