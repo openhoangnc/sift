@@ -205,6 +205,32 @@ pub fn compiled_count() -> usize {
         .count()
 }
 
+/// Drops every expression built so far.
+///
+/// Called before the engine is rebuilt. The expressions belong to rules the
+/// rebuild is about to replace, so they are discarded at the swap in any
+/// case; letting them go first means they are not held through the moment
+/// both engines are live, which is the peak the whole rebuild is measured by.
+/// At the ceiling that is 2,000 of them, about 25 KB each.
+///
+/// What it costs is the expressions the network asks for again being built
+/// again, at 105 microseconds each -- the same cost the swap imposes anyway,
+/// since the new engine's are empty.
+pub fn drop_compiled() {
+    let mut compiled = COMPILED.lock();
+
+    for weak in compiled.drain(..) {
+        let Some(lr) = weak.upgrade() else {
+            continue;
+        };
+
+        let mut slot = lr.re.write();
+        if matches!(&*slot, Slot::Built(_)) {
+            *slot = Slot::Empty;
+        }
+    }
+}
+
 impl LazyRegex {
     /// Holds an expression without compiling it.
     pub fn new(src: String) -> Self {

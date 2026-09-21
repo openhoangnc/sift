@@ -1448,45 +1448,120 @@ operator watching a container sees it and cannot tell it from a leak, which is
 what `peak_rss` and the counters in the snapshot are for — and, for anyone
 measuring the same thing again, so is the table above.
 
-### 55 MB of that peak was the builder's, and is gone
+### The peak, and what came off it
 
 The peak is dominated by two live engines and cannot go below that without a
-gap in filtering, but two things inside the build were paying for nothing.
+gap in filtering. What sat above that floor was avoidable, and three rounds of
+it have been measured in the image — arm64, musl, two containers from the same
+work directory doing the same refresh, `VmHWM` and nothing else.
 
 - **The domain index was handed 1.9M owned strings to produce 1.9M `u64`s.**
   `DomainIndex` stores no keys — a lookup is decided by `hashes[i] == h` and
   the caller's verification — so every domain the builder boxed was hashed
   once and dropped. It takes `(u64, u32)` pairs now, hashed where the rule is
-  parsed, which is the same arithmetic on the same bytes and frees the string
-  on the spot.
-- **`shrink_to_fit` was spending an 83 MB copy to recover 1 MB.** It allocates
-  the exact size and copies, so the process holds both for the moment it runs.
-  Doubling had left the rule vector 1.1% over — 2,097,152 slots for 2,073,416
-  rules — and that copy landed inside the rebuild's peak. `shrink_if_wasteful`
-  shrinks only past an eighth of waste, which still collects the vectors that
-  really are half empty.
+  parsed.
+- **The shortcut index sized a map from a guess.**
+  `AHashMap::with_capacity(long_offs.len() * 12)` asked hashbrown for 1.87M
+  entries for 155,609 patterns, which it rounds to 4,194,304 buckets: **71 MB
+  allocated inside every build**, every page touched, whatever the real number
+  of distinct windows turns out to be. The windows are collected and sorted
+  instead — one `u64` each, ~15 MB, freed before the selection pass — which
+  gives the exact count *and* the frequencies without a hash lookup per
+  window.
+- **Compiled expressions were held through the rebuild.** They belong to the
+  rules being replaced and are discarded at the swap in any case, so
+  `rule::drop_compiled()` lets them go before the new engine is built rather
+  than after. Worth 25 KB per expression against a ceiling of 2,000.
 
-Measured in the image on the same 37 lists, 2,220,397 rules, two containers
-from the same work directory doing the same refresh of 15 lists:
-
-| | v0.9.0 | after |
+| | v0.9.0 | now |
 |---|---:|---:|
-| loaded, settled | 284.3 MB | 281.8 MB |
-| peak loading | 413.9 MB | **355.9 MB** |
-| settled after a refresh | 327.8 MB | 327.4 MB |
-| peak during that refresh | 656.2 MB | **601.7 MB** |
+| loaded, settled | 284.2 MB | 277.7 MB |
+| peak loading | 413.9 MB | **335.6 MB** |
+| peak during a refresh, 349 expressions warm | 675.9 MB | **589.8 MB** |
 
-14% off the load peak and 8% off the refresh peak, with the settled size and
-every verdict unchanged — the differential test against Go's answers for 4,190
-domains covers that, and the whole suite passes.
+19% off the load peak and 13% off the refresh peak, the verdicts unchanged —
+the differential test against Go's answers for 4,190 domains covers that.
 
-**A third change was tried and dropped.** The index gives each repeated domain
-a `Vec` of its own while building, ~500,000 of them; threading them through
-two flat arrays instead is perhaps 10-18 MB of the 600. `loadprofile` on macOS
-could not measure it — the same binary varied by 80 MB between runs — and it
-complicates a structure every query goes through, so it was reverted rather
-than guessed at. If it is ever wanted, measure it in a musl container against
-`VmHWM` and nowhere else.
+### A claim in the last round was wrong: musl does not copy a growing vector
+
+The round before this one also made `shrink_to_fit` conditional, on the theory
+that shrinking an 83 MB vector cost an 83 MB copy inside the peak. **It does
+not, on the target this ships to**, and the −54 MB measured then was the
+domain-hash change alone.
+
+Rust's `System` allocator reallocates through libc, and musl's `mallocng`
+serves anything past its 128 KB mmap threshold from `mmap` and resizes it with
+`mremap(MREMAP_MAYMOVE)`: growing moves page tables rather than copying, and
+shrinking truncates in place and returns the pages at once. Measured in the
+image, a 160 MB vector:
+
+```
+80 MB allocated+touched      rss  80 MB   hwm  80 MB
+grown to 160 MB, untouched   rss  80 MB   hwm  80 MB     <- no copy
+160 MB touched               rss 160 MB   hwm 160 MB
+truncated+shrunk to 80 MB    rss  80 MB   hwm 160 MB     <- no spike
+```
+
+So the conditional shrink was reverted: it saved nothing and kept an overshoot
+musl hands back for free. Two rules follow for anyone tuning this further.
+Exact capacity planning for a large `Vec` is worth **nothing** here — what
+costs is a *hashbrown resize* (allocate-new-and-reinsert, both live) and the
+sheer number of small long-lived allocations, which is what the step after a
+refresh is made of. And macOS is not a measuring instrument for any of it:
+`loadprofile` there varied by 80 MB between runs of the same binary.
+
+### Where the rest of it is, if this is taken further
+
+Three expert reviews of the build path agree on the shape, and on rejecting
+the obvious idea. **Per-list indexes combined at query time is the wrong
+tool**: 37 segments means ~148 domain probes and ~590 shortcut-gate tests per
+query instead of 16, which is 0.5–0.9 µs becoming 3–6 µs on a desktop core and
+worse on a small ARM board, and the 256 KB gate staying in L2 is the thing
+this design was measured into. A front filter fixes the clean path but not the
+blocked one; a global router that fixes both is itself a full-size table
+rebuilt every refresh.
+
+What they agree *does* work, in order of value against risk:
+
+1. **`NetworkRule` from 40 bytes to 16** — `pattern` tag, `list_id` and
+   `allowlist` become flags plus a side table; `list_id` is already derivable
+   from `net_text[idx].src`. Peak −100 MB, steady −50 MB, latency neutral,
+   and `crates/sift-filter/tests/sizes.rs` already guards the layout.
+2. **Segment the storage, keep one global index.** One parsed segment per
+   list version, reused across rebuilds when `Arc::ptr_eq` says the text did
+   not change; rebuild only the global tables over the segments in order, with
+   rule references packed as `(ordinal, local)` so the existing `ai < bi`
+   tie-break is unchanged. Removes the unchanged lists' rules from the second
+   copy — ~124 MB of the transient — and stops re-parsing them, which is most
+   of the rebuild's seconds. It also keeps unchanged lists' compiled
+   expressions warm across a refresh.
+3. **Host rules as text references with a hash-only index** — 147,175 host
+   rules are 7% of the rules and 20% of the engine, at ~280 bytes each against
+   ~60 for a network rule. Peak −64 MB, steady −32 MB.
+4. **Builder scratch**: `DomainIndex::build` sorting its pairs instead of
+   growing a table from 1,024 slots and keeping ~500,000 per-domain `Vec`s;
+   the shortcut map keyed by hash rather than `String`. Peak −40 MB.
+5. **Regenerate the regex source instead of storing it** — it is a pure
+   function of the rule text, which is one `text_of` away. Peak −30 MB.
+
+If all of that landed, the arithmetic is a refresh peaking near 300–350 MB
+against a settled 175 MB — a refresh below today's *load* peak.
+
+**The compatibility conditions, if segmentation is ever built.** A review
+against the Go semantics found the merge is exact only when: the `$badfilter`
+set is the **union** across segments and is passed *into* each segment's
+candidate loop, because a `$badfilter` rule in the user's own list cancels a
+rule in a subscribed one; host rules are concatenated across segments
+**before** the address-family narrowing, not after; `0` and `-1` keep their
+positions, since `reason_for_list` reads the first cited rule's list id to
+tell `RewrittenAutoHosts` from a block; and the allow side's emptiness test
+becomes "every allow segment is empty". The same review turned up three
+pre-existing divergences from Go that are nothing to do with memory and are
+recorded under *Deliberate deviations* to be checked against a running build:
+the system hosts file is a list inside the block set here where Go consults it
+first, `canonical_text` compares `$badfilter` by text where Go compares
+parsed structure, and `@@||host^$dnsrewrite=` is applied as a rewrite here
+where urlfilter treats it as an exception.
 
 ### Using it
 

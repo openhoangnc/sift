@@ -399,6 +399,12 @@ impl Reloader for LiveReloader {
     }
 
     fn reload_filters(&self, filters: &Manager) {
+        // The expressions built so far belong to the engine about to be
+        // replaced, so they go before the new one is built rather than with
+        // the old one afterwards: holding them through the rebuild puts them
+        // inside its peak for nothing.
+        sift_filter::rule::drop_compiled();
+
         self.resolver.set_engine(filters.build_engine());
         self.resolver.set_services(filters.build_services_engine());
     }

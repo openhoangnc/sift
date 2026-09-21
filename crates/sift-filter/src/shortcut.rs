@@ -294,12 +294,37 @@ impl ShortcutIndex {
         // Every window's frequency across the pattern set, then its load —
         // how many patterns have been filed under it — so that each pattern
         // takes its rarest window, and among equally rare ones the emptiest.
-        let mut grams: AHashMap<u64, (u32, u32)> = AHashMap::with_capacity(long_offs.len() * 12);
+        //
+        // Sized from the number of *distinct* windows rather than from a
+        // guess at how many each pattern has. `with_capacity(patterns * 12)`
+        // asked hashbrown for 1.87M entries on a real list set, which it
+        // rounds up to 4,194,304 buckets -- 71 MB allocated inside every
+        // build, every page of it touched, whatever the real number turns out
+        // to be. Collecting the windows and sorting them costs one `u64` each
+        // -- 15 MB, freed before the selection pass -- and gives both the
+        // exact count and the frequencies without a hash lookup per window.
+        let mut all: Vec<u64> = Vec::new();
         for &off in &long_offs {
-            for w in windows(&arena[text_range(&arena, off)]) {
-                grams.entry(w).or_default().0 += 1;
-            }
+            all.extend(windows(&arena[text_range(&arena, off)]));
         }
+        all.sort_unstable();
+
+        let distinct =
+            all.windows(2).filter(|w| w[0] != w[1]).count() + usize::from(!all.is_empty());
+        let mut grams: AHashMap<u64, (u32, u32)> = AHashMap::with_capacity(distinct);
+
+        let mut i = 0;
+        while i < all.len() {
+            let w = all[i];
+            let mut j = i + 1;
+            while j < all.len() && all[j] == w {
+                j += 1;
+            }
+            grams.insert(w, ((j - i) as u32, 0));
+            i = j;
+        }
+
+        drop(all);
 
         let mut long = Table::default();
         let mut long_gate: Vec<u64> = Vec::new();
