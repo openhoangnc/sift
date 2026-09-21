@@ -91,66 +91,89 @@ impl DomainIndex {
     /// produce 1.9M `u64`s and drop them again. Hashing where the rule is
     /// parsed is the same arithmetic on the same bytes, and the string is
     /// freed on the spot.
-    pub fn build(pairs: Vec<(u64, u32)>) -> Self {
+    pub fn build(mut pairs: Vec<(u64, u32)>) -> Self {
         if pairs.is_empty() {
             return Self::default();
         }
 
-        // Grown on demand rather than sized from `pairs.len()`: a blocklist
-        // names the same domain from several lists, so pairs outnumber
-        // domains by a lot — on a real 37-list installation, 1,984,815 pairs
-        // for 1,122,077 domains. Sizing for the pairs left the table less
-        // than a third full and cost twice the memory it needed.
-        let mut cap = 1024usize;
-        let mut mask = cap - 1;
-        let mut hashes = vec![0u64; cap];
-        let mut vals = vec![EMPTY; cap];
-        let mut groups: Vec<Vec<u32>> = Vec::new();
-        let mut len = 0usize;
+        // Sorted by hash alone, and **stably**, which puts each domain's
+        // rules in one contiguous run still in the order they arrived -- the
+        // order upstream considers them and the order `get` promises. Sorting
+        // by the pair would order a run by rule index instead, which is the
+        // same thing only because the builder happens to append in that
+        // order; `keeps_every_rule_for_one_domain_in_order` passes indices
+        // out of order precisely so that assumption cannot creep in.
+        //
+        // Sorting costs one pass over 16 bytes a pair. What it replaces cost
+        // a good deal more: the table was grown from 1,024 slots by doubling,
+        // and each doubling allocated new tables and reinserted into them
+        // while the old ones were still live, eleven times over on a real
+        // list set; and every domain named more than once got a `Vec` of its
+        // own, about 500,000 of them, live until the runs were flattened.
+        // Both sat inside the rebuild's peak.
+        pairs.sort_by_key(|&(h, _)| h);
 
-        for &(h, idx) in &pairs {
-            if (len + 1) * 10 > cap * 7 {
-                let (nh, nv, nc) = Self::grow(&hashes, &vals, cap);
-                hashes = nh;
-                vals = nv;
-                cap = nc;
-                mask = cap - 1;
+        // One pass for both sizes: how many domains there are, and how much
+        // spill their repeats need -- a run of n rules takes a length and n
+        // entries.
+        let (mut len, mut spill_len) = (0usize, 0usize);
+        let mut i = 0;
+        while i < pairs.len() {
+            let mut j = i + 1;
+            while j < pairs.len() && pairs[j].0 == pairs[i].0 {
+                j += 1;
             }
 
-            let mut i = (h as usize) & mask;
-            loop {
-                if vals[i] == EMPTY {
-                    hashes[i] = h;
-                    vals[i] = idx;
-                    len += 1;
-                    break;
-                }
-                if hashes[i] == h {
-                    // The same domain again: start or extend its group.
-                    if vals[i] & SPILL == 0 {
-                        groups.push(vec![vals[i], idx]);
-                        vals[i] = SPILL | (groups.len() - 1) as u32;
-                    } else {
-                        groups[(vals[i] & !SPILL) as usize].push(idx);
-                    }
-                    break;
-                }
-                i = (i + 1) & mask;
+            len += 1;
+            if j - i > 1 {
+                spill_len += 1 + (j - i);
             }
+
+            i = j;
         }
 
-        // Flatten the groups into one run-length encoded array, so a domain's
-        // rules are contiguous and cost no per-domain allocation.
-        let mut spill: Vec<u32> = Vec::new();
-        for v in vals.iter_mut() {
-            if *v == EMPTY || *v & SPILL == 0 {
-                continue;
+        // Sized from the domains rather than the pairs: a blocklist names the
+        // same domain from several lists, so pairs outnumber domains by a lot
+        // -- on a real 37-list installation, 1,917,629 pairs for 1,232,249
+        // domains. Sizing for the pairs left the table less than a third full
+        // and cost twice the memory it needed. Kept under a 70% load, which
+        // also guarantees the empty slot a miss stops on.
+        let mut cap = 1024usize;
+        while (len + 1) * 10 > cap * 7 {
+            cap *= 2;
+        }
+
+        let mask = cap - 1;
+        let mut hashes = vec![0u64; cap];
+        let mut vals = vec![EMPTY; cap];
+        let mut spill: Vec<u32> = Vec::with_capacity(spill_len);
+
+        let mut i = 0;
+        while i < pairs.len() {
+            let h = pairs[i].0;
+            let mut j = i + 1;
+            while j < pairs.len() && pairs[j].0 == h {
+                j += 1;
             }
-            let run = &groups[(*v & !SPILL) as usize];
-            let off = spill.len() as u32;
-            spill.push(run.len() as u32);
-            spill.extend_from_slice(run);
-            *v = SPILL | off;
+
+            let mut slot = (h as usize) & mask;
+            while vals[slot] != EMPTY {
+                slot = (slot + 1) & mask;
+            }
+
+            hashes[slot] = h;
+            vals[slot] = if j - i == 1 {
+                // One rule: it lives in the slot itself.
+                pairs[i].1
+            } else {
+                let off = spill.len() as u32;
+                spill.push((j - i) as u32);
+                spill.extend(pairs[i..j].iter().map(|&(_, idx)| idx));
+
+                SPILL | off
+            };
+
+            i = j;
         }
 
         Self {
@@ -160,31 +183,6 @@ impl DomainIndex {
             mask,
             len,
         }
-    }
-
-    /// Doubles the table, rehashing what is already in it.
-    ///
-    /// Values move untouched: a spill value names a group, not a slot.
-    fn grow(hashes: &[u64], vals: &[u32], cap: usize) -> (Vec<u64>, Vec<u32>, usize) {
-        let ncap = cap * 2;
-        let nmask = ncap - 1;
-        let mut nh = vec![0u64; ncap];
-        let mut nv = vec![EMPTY; ncap];
-
-        for (j, &v) in vals.iter().enumerate() {
-            if v == EMPTY {
-                continue;
-            }
-            let h = hashes[j];
-            let mut i = (h as usize) & nmask;
-            while nv[i] != EMPTY {
-                i = (i + 1) & nmask;
-            }
-            nh[i] = h;
-            nv[i] = v;
-        }
-
-        (nh, nv, ncap)
     }
 
     /// The rule indices filed under `key`, or an empty slice.
@@ -292,6 +290,49 @@ mod tests {
         for (k, v) in &pairs {
             assert_eq!(i.get(k, |_| true), &[*v], "{k}");
         }
+        assert!(i.get("absent.example.com", |_| true).is_empty());
+    }
+
+    #[test]
+    fn runs_and_singles_survive_a_table_that_has_to_probe() {
+        // The build packs a domain named once into its slot and a domain
+        // named more than once into a spill run, and fills the table in hash
+        // order rather than arrival order, so a slot is often reached by
+        // probing past another. This mixes the two shapes, repeats out of
+        // index order, and checks every key against what arrived.
+        let mut pairs: Vec<(String, u32)> = Vec::new();
+        let mut idx = 0u32;
+        for n in 0..3_000u32 {
+            let key = format!("host{n}.example.com");
+            // Every third domain is named three times, the rest once, and
+            // the repeats are pushed with descending indices so index order
+            // and arrival order cannot be confused.
+            let times = if n % 3 == 0 { 3 } else { 1 };
+            for _ in 0..times {
+                idx += 7;
+                pairs.push((key.clone(), 1_000_000 - idx));
+            }
+        }
+
+        let i = DomainIndex::build(
+            pairs
+                .iter()
+                .map(|(k, v)| (DomainIndex::hash(k), *v))
+                .collect(),
+        );
+
+        assert_eq!(i.len(), 3_000);
+        for n in 0..3_000u32 {
+            let key = format!("host{n}.example.com");
+            let want: Vec<u32> = pairs
+                .iter()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, v)| *v)
+                .collect();
+
+            assert_eq!(i.get(&key, |_| true), want.as_slice(), "{key}");
+        }
+
         assert!(i.get("absent.example.com", |_| true).is_empty());
     }
 
