@@ -1499,13 +1499,21 @@ work directory doing the same refresh, `VmHWM` and nothing else.
   has to pass the caller's verification, which is there because no keys are
   stored at all.
 
+- **An expression kept its source, which is a copy of the rule's own text.**
+  `LazyRegex` held what `to_regex` made of the pattern -- 156,000 of them,
+  about 18 MB, to say what the rule text next to it already said. The matcher
+  regenerates it from the text if and when it has to build, which is the
+  first match against that rule and the first after an eviction. The parser
+  stops generating it at all for the wildcard forms, which is 156,000
+  `to_regex` calls off the load.
+
 | | v0.9.0 | now |
 |---|---:|---:|
-| loaded, settled | 284.2 MB | **208.9 MB** |
-| peak loading | 413.9 MB | **265.3 MB** |
-| peak during a refresh of 10 of 37 lists | 662.4 MB | **448.6 MB** |
+| loaded, settled | 284.2 MB | **195.5 MB** |
+| peak loading | 413.9 MB | **256.5 MB** |
+| peak during a refresh of 10 of 37 lists | 662.4 MB | **432.7 MB** |
 
-36% off the load peak and 32% off the refresh peak, 75 MB off the steady size,
+38% off the load peak and 35% off the refresh peak, 89 MB off the steady size,
 and the verdicts unchanged — the differential test against Go's answers for
 4,190 domains covers that, and `sizes.rs` now fails if a rule grows past 24
 bytes. Each step was measured in the image against the commit before it, not
@@ -1518,6 +1526,7 @@ against v0.9.0, so the numbers add up rather than overlapping:
 | domain index built by sorting | −2 MB | −3 MB |
 | `NetworkRule` 40 bytes to 24 | −33 MB | −66 MB |
 | host rules without their duplicate names, half-width index hashes | −35 MB | −70 MB |
+| expressions without their stored source | −9 MB | −18 MB |
 
 The engine's own estimate of itself falls from 192.0 MB to 123.0 MB over
 those, which is the number the peak is twice.

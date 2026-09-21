@@ -250,8 +250,6 @@ impl NetworkRule {
 /// is cached, including a failure: a source that will not compile can never
 /// match, which is what dropping the rule at load achieved.
 pub struct LazyRegex {
-    /// The expression source, as [`crate::pattern::to_regex`] produced it.
-    src: Box<str>,
     /// The compiled form, while it is being kept.
     re: RwLock<Slot>,
     /// Whether anything has matched against it since it was last considered
@@ -345,11 +343,23 @@ pub fn drop_compiled() {
     }
 }
 
+impl Default for LazyRegex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LazyRegex {
-    /// Holds an expression without compiling it.
-    pub fn new(src: String) -> Self {
+    /// Holds an expression without compiling it, and without its source.
+    ///
+    /// The source is what [`crate::pattern::to_regex`] makes of the rule's
+    /// pattern, which is a slice of the rule's own text -- so keeping it was
+    /// keeping a derived copy of something already in memory, about 15 MB
+    /// across the 156,000 expression rules of a real installation, doubled
+    /// while a rebuild holds two engines. It is passed to [`Self::is_match`]
+    /// instead, which asks for it only when it has to build.
+    pub fn new() -> Self {
         Self {
-            src: src.into_boxed_str(),
             re: RwLock::new(Slot::Empty),
             used: AtomicBool::new(false),
         }
@@ -362,16 +372,19 @@ impl LazyRegex {
     ///
     /// It is not registered for eviction: a user writes few of these by hand,
     /// and dropping one would lose the validation that compiling it proved.
-    pub fn compiled(src: String, re: Regex) -> Self {
+    pub fn compiled(re: Regex) -> Self {
         Self {
-            src: src.into_boxed_str(),
             re: RwLock::new(Slot::Built(Arc::new(re))),
             used: AtomicBool::new(false),
         }
     }
 
     /// Reports whether the expression matches, building it if needed.
-    pub fn is_match(self: &Arc<Self>, haystack: &str) -> bool {
+    ///
+    /// `src` is called only when there is nothing built -- the first match
+    /// against this rule, or the first since it was evicted -- so the common
+    /// path never pays for regenerating it.
+    pub fn is_match(self: &Arc<Self>, haystack: &str, src: impl FnOnce() -> String) -> bool {
         // Take a reference to the expression and let the lock go before
         // matching against it.
         let held = match &*self.re.read() {
@@ -386,12 +399,12 @@ impl LazyRegex {
             return re.is_match(haystack);
         }
 
-        self.build().is_some_and(|re| re.is_match(haystack))
+        self.build(&src()).is_some_and(|re| re.is_match(haystack))
     }
 
     /// Builds the expression and keeps it, evicting the oldest if need be.
-    fn build(self: &Arc<Self>) -> Option<Arc<Regex>> {
-        let Some(re) = Regex::new(&self.src).ok().map(Arc::new) else {
+    fn build(self: &Arc<Self>, src: &str) -> Option<Arc<Regex>> {
+        let Some(re) = Regex::new(src).ok().map(Arc::new) else {
             *self.re.write() = Slot::Failed;
 
             return None;
@@ -440,11 +453,6 @@ impl LazyRegex {
         Some(re)
     }
 
-    /// The expression source.
-    pub fn source(&self) -> &str {
-        &self.src
-    }
-
     /// Whether the expression is built and being kept, for tests.
     #[cfg(test)]
     fn is_built(&self) -> bool {
@@ -455,7 +463,6 @@ impl LazyRegex {
 impl std::fmt::Debug for LazyRegex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LazyRegex")
-            .field("src", &self.src)
             .field("compiled", &matches!(&*self.re.read(), Slot::Built(_)))
             .finish()
     }
@@ -723,6 +730,26 @@ fn parse_network_rule(t: &str) -> Result<ParsedNetwork, ParseError> {
 /// The `$` that introduces modifiers is the last unescaped one that is not
 /// inside a `/regex/` pattern.
 fn split_options(s: &str) -> Result<(&str, Options), ParseError> {
+    let Some(i) = options_at(s) else {
+        return Ok((s, Options::default()));
+    };
+
+    let opts = parse_options(&s[i + 1..])?;
+
+    Ok((&s[..i], opts))
+}
+
+/// The rule body's pattern, without its modifiers.
+///
+/// The same answer `split_options` gives, without parsing the modifiers:
+/// what regenerating an expression needs, and shared with the parser so the
+/// two cannot disagree about where a pattern ends.
+pub(crate) fn pattern_part(s: &str) -> &str {
+    options_at(s).map_or(s, |i| &s[..i])
+}
+
+/// Where a rule body's modifier list starts, if it has one.
+fn options_at(s: &str) -> Option<usize> {
     let b = s.as_bytes();
     let in_regex = b.first() == Some(&b'/') && s.len() > 1;
 
@@ -742,15 +769,8 @@ fn split_options(s: &str) -> Result<(&str, Options), ParseError> {
         i += 1;
     }
 
-    // Only the *last* `$` at the top level starts modifiers, and only if the
-    // text after it parses as a modifier list.
-    let Some(i) = idx else {
-        return Ok((s, Options::default()));
-    };
-
-    let opts = parse_options(&s[i + 1..])?;
-
-    Ok((&s[..i], opts))
+    // Only the *last* `$` at the top level starts modifiers.
+    idx
 }
 
 /// Parses a comma-separated modifier list.
@@ -935,20 +955,21 @@ fn parse_pattern(s: &str) -> Result<(Pattern, Option<String>), ParseError> {
         return Ok((Pattern::DomainAnchor, Some(dom)));
     }
 
-    let src = pattern::to_regex(s);
-
     // A `/regex/` pattern is written by hand, so it is compiled here and a
     // malformed one is still rejected at load. Everything else is generated
     // by `to_regex` from a wildcard pattern -- `generated_patterns_compile`
     // covers that -- and compiling a few hundred thousand of those up front
     // is the single most expensive thing a large installation does at start.
+    // Nor is one generated here: the matcher makes it from the rule's text
+    // if and when it has to build.
     let lazy = if pattern::is_regex_pattern(s) {
+        let src = pattern::to_regex(s);
         let re = Regex::new(&src)
             .map_err(|e| ParseError::Invalid(format!("pattern {s:?} -> {src:?}: {e}")))?;
 
-        LazyRegex::compiled(src, re)
+        LazyRegex::compiled(re)
     } else {
-        LazyRegex::new(src)
+        LazyRegex::new()
     };
 
     Ok((
@@ -1016,8 +1037,34 @@ mod tests {
         };
 
         assert!(!re.is_built(), "the automaton was built at parse time");
-        assert!(re.is_match("http://example.com/ads/banner.png"));
+        assert!(re.is_match("http://example.com/ads/banner.png", || {
+            pattern::to_regex("/ads/banner")
+        }));
         assert!(re.is_built(), "the automaton should now be cached");
+    }
+
+    /// An expression and the source it rebuilds from, as the engine pairs
+    /// them: the rule keeps no copy, so the caller supplies it.
+    struct Lazy {
+        re: Arc<LazyRegex>,
+        src: String,
+    }
+
+    impl Lazy {
+        fn new(src: &str) -> Self {
+            Self {
+                re: Arc::new(LazyRegex::new()),
+                src: src.to_string(),
+            }
+        }
+
+        fn is_match(&self, haystack: &str) -> bool {
+            self.re.is_match(haystack, || self.src.clone())
+        }
+
+        fn is_built(&self) -> bool {
+            self.re.is_built()
+        }
     }
 
     #[test]
@@ -1027,8 +1074,8 @@ mod tests {
         // one that is built arrives at the same ceiling more slowly: on the
         // installation this came from, 156,557 rules need an expression and
         // one costs about 25 KB.
-        let held: Vec<Arc<LazyRegex>> = (0..MAX_COMPILED + 64)
-            .map(|i| Arc::new(LazyRegex::new(format!("(?i)ads{i}\\.example\\.com"))))
+        let held: Vec<Lazy> = (0..MAX_COMPILED + 64)
+            .map(|i| Lazy::new(&format!("(?i)ads{i}\\.example\\.com")))
             .collect();
 
         for (i, re) in held.iter().enumerate() {
@@ -1070,11 +1117,11 @@ mod tests {
         // Oldest-first alone would throw away an expression the network keeps
         // reaching, and pay 105 microseconds to build it again on the next
         // query that reaches it.
-        let hot = Arc::new(LazyRegex::new(r"(?i)hot\.example\.com".to_string()));
+        let hot = Lazy::new(r"(?i)hot\.example\.com");
         assert!(hot.is_match("hot.example.com"));
 
         for i in 0..MAX_COMPILED + 64 {
-            let cold = Arc::new(LazyRegex::new(format!(r"(?i)cold{i}\.example\.com")));
+            let cold = Lazy::new(&format!(r"(?i)cold{i}\.example\.com"));
             assert!(cold.is_match(&format!("cold{i}.example.com")));
             // Reaching it again is what earns it the second chance.
             assert!(hot.is_match("hot.example.com"));

@@ -372,7 +372,7 @@ impl RuleSet {
             return;
         }
 
-        if !self.applies(r, req, url) {
+        if !self.applies(idx, r, req, url) {
             return;
         }
 
@@ -389,14 +389,14 @@ impl RuleSet {
 
     /// Reports whether `r` applies to `req`, checking both the pattern and the
     /// modifiers.
-    fn applies(&self, r: &NetworkRule, req: &Request<'_>, url: &str) -> bool {
+    fn applies(&self, idx: u32, r: &NetworkRule, req: &Request<'_>, url: &str) -> bool {
         if r.badfilter() {
             return false;
         }
 
         let Some(opts) = r.opts() else {
             // No modifiers: only the pattern decides.
-            return self.pattern_matches(r, req, url);
+            return self.pattern_matches(idx, r, req, url);
         };
 
         if let Some(t) = &opts.dnstype
@@ -431,21 +431,38 @@ impl RuleSet {
             return false;
         }
 
-        self.pattern_matches(r, req, url)
+        self.pattern_matches(idx, r, req, url)
     }
 
     /// Reports whether the rule's pattern matches the request.
-    fn pattern_matches(&self, r: &NetworkRule, req: &Request<'_>, url: &str) -> bool {
+    fn pattern_matches(&self, idx: u32, r: &NetworkRule, req: &Request<'_>, url: &str) -> bool {
         match r.pattern() {
             PatternRef::Any => true,
             // Reaching a domain-anchored rule means the domain index already
             // matched one of the hostname's suffixes.
             PatternRef::DomainAnchor => true,
-            PatternRef::Rx { re, target } => match target {
-                Target::Url => re.is_match(url),
-                Target::Hostname => re.is_match(req.hostname),
-            },
+            PatternRef::Rx { re, target } => {
+                let hay = match target {
+                    Target::Url => url,
+                    Target::Hostname => req.hostname,
+                };
+
+                re.is_match(hay, || self.regex_source_of(idx))
+            }
         }
+    }
+
+    /// The expression source for a rule, made from the rule's own text.
+    ///
+    /// Only reached when an expression has to be built -- the first match
+    /// against the rule, or the first since the ceiling evicted it. The rule
+    /// keeps no copy of this: it is `to_regex` of the pattern, and the
+    /// pattern is a slice of the text the set already holds.
+    fn regex_source_of(&self, idx: u32) -> String {
+        let text = self.text_of(idx);
+        let body = text.strip_prefix("@@").unwrap_or(text);
+
+        crate::pattern::to_regex(crate::rule::pattern_part(body))
     }
 
     /// Finds host rules for the request's hostname.
@@ -946,6 +963,48 @@ mod tests {
 
     fn matches(e: &Engine, host: &str) -> MatchResult {
         e.match_request(&req(host, A))
+    }
+
+    #[test]
+    fn an_expression_is_rebuilt_from_the_rule_text() {
+        // The source is not stored on the rule, so the set makes it from the
+        // text when it has to build: strip `@@`, drop the modifiers, and
+        // `to_regex` what is left. If that disagrees with what the parser
+        // matched on, a rule quietly matches something else. Checked against
+        // `to_regex` of the pattern for the awkward shapes -- an exception,
+        // modifiers, a `/regex/` form, and a `$` inside the pattern itself.
+        for (line, pattern) in [
+            ("ads*banner", "ads*banner"),
+            ("@@ads*banner", "ads*banner"),
+            ("ads*banner$important", "ads*banner"),
+            ("@@ads*banner$important,badfilter", "ads*banner"),
+            ("/^ads?\\./", "/^ads?\\./"),
+            ("/a\\$b/$important", "/a\\$b/"),
+        ] {
+            let set = RuleSet::build([(1i64, line)]);
+
+            assert_eq!(
+                set.regex_source_of(0),
+                crate::pattern::to_regex(pattern),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_expression_rule_still_matches_without_a_stored_source() {
+        // End to end: the rule carries no source, so this only answers if the
+        // regenerated one compiles to the same expression.
+        let e = engine("@@ads*banner.example^$important\n");
+
+        assert_eq!(
+            matches(&e, "ads-x-banner.example").reason,
+            Reason::NotFilteredAllowList
+        );
+        assert_eq!(
+            matches(&e, "nothing.example").reason,
+            Reason::NotFilteredNotFound
+        );
     }
 
     #[test]
