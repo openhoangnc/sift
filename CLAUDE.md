@@ -151,6 +151,13 @@ The comparison harnesses live in `tests/compat/`:
   what the OPT record says. Contents are not compared, because a CDN may
   legitimately answer the two differently — but it cannot make one of them
   volunteer an `RRSIG` nobody asked for.
+- `dnsrewrite_diff.py` — `$dnsrewrite` and, the part that needed a running
+  server to get right, its exceptions: `@@||host^$dnsrewrite=…` removes
+  matching rewrites rather than applying one, an exception with no value (and
+  `=NOERROR`, which parses to the same thing) removes rewrites of *any* value,
+  and the comparison is by the parsed value rather than the text. It replaces
+  the user rules to do that and puts the originals back, so `verify.sh` runs
+  it beside `ratelimit_diff.py` after everything that changes nothing.
 - `gob-oracle/` — a small Go program that encodes and decodes the statistics
   unit with Go's own `encoding/gob`, so the Rust codec is checked against the
   implementation it must interoperate with.

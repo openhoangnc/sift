@@ -711,6 +711,54 @@ impl Builder {
     }
 }
 
+/// Reports whether an `@@…$dnsrewrite` rule removes `rule` from the rewrites.
+///
+/// Upstream's `removeMatchingException`, captured from a running v0.107.79
+/// rather than read off it:
+///
+/// | exception | rewrite | outcome |
+/// |---|---|---|
+/// | `@@…$dnsrewrite` | `…$dnsrewrite=1.2.3.4` | removed |
+/// | `@@…$dnsrewrite=1.2.3.4` | `…$dnsrewrite=1.2.3.4` | removed |
+/// | `@@…$dnsrewrite=1.2.3.4` | `…$dnsrewrite=5.6.7.8` | kept |
+/// | `@@…$dnsrewrite` | `…$dnsrewrite=1.2.3.4,important` | kept |
+/// | `@@…$dnsrewrite,important` | `…$dnsrewrite=1.2.3.4,important` | removed |
+///
+/// Two details are the ones a reading of the source would get wrong. An
+/// exception carrying no value -- and `=NOERROR`, which parses to the same
+/// thing -- removes *every* rewrite rather than the ones that answer NOERROR:
+/// `@@||a.example^$dnsrewrite=NOERROR` removes `$dnsrewrite=1.2.3.4`. And the
+/// comparison is by the **parsed** value, not the text, so
+/// `@@…$dnsrewrite=1.2.3.4` removes `…$dnsrewrite=NOERROR;A;1.2.3.4`.
+fn excepts(exception: &NetworkRule, rule: &NetworkRule) -> bool {
+    // An ordinary exception leaves an `$important` rewrite alone; an
+    // `$important` one takes it too.
+    if rule.important() && !exception.important() {
+        return false;
+    }
+
+    match exception.dnsrewrite() {
+        // No value: every rewrite this rule matched.
+        Some(DnsRewrite::RCode(0)) => true,
+        Some(v) => rule.dnsrewrite() == Some(v),
+        None => false,
+    }
+}
+
+/// Reports whether a rule rewrites the host to itself, which is no rewrite.
+///
+/// Upstream drops it in `processDNSResultRewrites` (`res.CanonName == host`),
+/// and a running v0.107.79 answers `NotFilteredNotFound` for
+/// `||a.example^$dnsrewrite=a.example`, resolving the name normally.
+fn rewrites_to_itself(rule: &NetworkRule, hostname: &str) -> bool {
+    match rule.dnsrewrite() {
+        Some(DnsRewrite::CName(c)) => c
+            .trim_matches('.')
+            .eq_ignore_ascii_case(hostname.trim_matches('.')),
+        _ => false,
+    }
+}
+
 /// The filtering engine: an allowlist set that short-circuits, and a blocklist
 /// set consulted when nothing allowed the request.
 #[derive(Default)]
@@ -774,19 +822,25 @@ impl Engine {
 
         let (net, rewrites) = self.block.match_network(req);
 
-        // 2. `$dnsrewrite` rules, unless one of them excludes the host.
+        // 2. `$dnsrewrite` rules, less the ones an `@@` rule excepts and the
+        //    ones that rewrite the host to itself.
         if !rewrites.is_empty() {
-            let excluded = rewrites
+            let kept: Vec<(u32, &NetworkRule)> = rewrites
                 .iter()
-                .any(|(_, r)| matches!(r.dnsrewrite(), Some(DnsRewrite::Exclude)));
-            if !excluded {
+                .copied()
+                .filter(|(_, r)| !r.allowlist)
+                .filter(|&(_, r)| !rewrites.iter().any(|&(_, e)| e.allowlist && excepts(e, r)))
+                .filter(|&(_, r)| !rewrites_to_itself(r, req.hostname))
+                .collect();
+
+            if !kept.is_empty() {
                 return MatchResult {
                     reason: Reason::RewrittenRule,
-                    rules: rewrites
+                    rules: kept
                         .iter()
                         .map(|&(i, r)| to_matched(&self.block, r, i))
                         .collect(),
-                    rewrites: rewrites
+                    rewrites: kept
                         .iter()
                         .filter_map(|(_, r)| r.dnsrewrite().cloned())
                         .collect(),

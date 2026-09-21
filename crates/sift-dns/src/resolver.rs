@@ -1031,8 +1031,15 @@ impl Resolver {
 
         let ttl = settings.blocking.ttl.max(1);
 
-        // A response code wins over anything else.
-        if let Some(R::RCode(rc)) = rewrites.iter().find(|r| matches!(r, R::RCode(_))) {
+        // A response code other than NOERROR wins over anything else. NOERROR
+        // does not: a running v0.107.79 answers `1.2.3.4` for
+        // `||a.example^$dnsrewrite=1.2.3.4` beside
+        // `||a.example^$dnsrewrite=NOERROR`, citing both rules. On its own
+        // that NOERROR is an empty answer, which is the fall-through below.
+        if let Some(R::RCode(rc)) = rewrites
+            .iter()
+            .find(|r| matches!(r, R::RCode(c) if *c != 0))
+        {
             let code = ResponseCode::from(0, *rc as u8);
             let mut resp = msg::reply(req, code);
             if code == ResponseCode::NXDomain {
@@ -1063,10 +1070,13 @@ impl Resolver {
             return Some(msg::with_addrs(req, &addrs, ttl));
         }
 
-        // Arbitrary record rewrites are matched but produce no answer here.
+        // A rewrite with no records of its own -- `$dnsrewrite`,
+        // `$dnsrewrite=`, `$dnsrewrite=NOERROR` -- answers NOERROR and
+        // nothing else, and so does an arbitrary record type, which is
+        // matched here but not served.
         rewrites
             .iter()
-            .any(|r| matches!(r, R::Record { .. }))
+            .any(|r| matches!(r, R::Record { .. } | R::RCode(0)))
             .then(|| msg::nodata(req, ttl))
     }
 }
@@ -1357,6 +1367,63 @@ mod tests {
             answer_addrs(out.response().unwrap()),
             vec!["1.2.3.4".parse::<IpAddr>().unwrap()]
         );
+    }
+
+    #[tokio::test]
+    async fn a_dnsrewrite_with_no_value_answers_noerror_and_nothing() {
+        // Captured from a running v0.107.79: `$dnsrewrite`, `$dnsrewrite=`
+        // and `$dnsrewrite=NOERROR` all report `RewriteRule` and answer
+        // NOERROR with an empty answer section. This build used to read them
+        // as cancelling every rewrite for the host, and so resolved the name
+        // upstream instead.
+        for rule in [
+            "||a.example.com^$dnsrewrite\n",
+            "||a.example.com^$dnsrewrite=\n",
+            "||a.example.com^$dnsrewrite=NOERROR\n",
+        ] {
+            let r = resolver(rule, Table::default(), Settings::default());
+            let out = resolve(&r, "a.example.com.", RecordType::A, Proto::Udp).await;
+
+            assert_eq!(out.reason, Reason::RewrittenRule, "{rule}");
+
+            let resp = out.response().unwrap();
+            assert_eq!(resp.metadata.response_code, ResponseCode::NoError, "{rule}");
+            assert!(resp.answers.is_empty(), "{rule}: {:?}", resp.answers);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_address_rewrite_outranks_a_noerror_one() {
+        // Both rules match and both are cited, and the answer is the address:
+        // a NOERROR rewrite contributes no records rather than suppressing
+        // the ones beside it.
+        let r = resolver(
+            "||a.example.com^$dnsrewrite=1.2.3.4\n||a.example.com^$dnsrewrite=NOERROR\n",
+            Table::default(),
+            Settings::default(),
+        );
+        let out = resolve(&r, "a.example.com.", RecordType::A, Proto::Udp).await;
+
+        assert_eq!(out.reason, Reason::RewrittenRule);
+        assert_eq!(
+            answer_addrs(out.response().unwrap()),
+            vec!["1.2.3.4".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exception_leaves_the_name_to_resolve_normally() {
+        // `@@||host^$dnsrewrite` removes the rewrite rather than applying one
+        // of its own, so nothing is synthesised and the query goes on as if
+        // no rule had matched.
+        let r = resolver(
+            "||a.example.com^$dnsrewrite=1.2.3.4\n@@||a.example.com^$dnsrewrite\n",
+            Table::default(),
+            Settings::default(),
+        );
+        let out = resolve(&r, "a.example.com.", RecordType::A, Proto::Udp).await;
+
+        assert_eq!(out.reason, Reason::NotFilteredNotFound);
     }
 
     #[tokio::test]

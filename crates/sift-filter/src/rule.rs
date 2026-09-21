@@ -479,8 +479,6 @@ pub enum DnsRewrite {
         /// The record's textual value.
         value: String,
     },
-    /// Exclude the host from other `$dnsrewrite` rules.
-    Exclude,
 }
 
 /// Why a rule could not be parsed.
@@ -769,20 +767,19 @@ fn parse_type_list(s: &str) -> Result<TypeList, ParseError> {
 /// Accepts the shorthand forms (`1.2.3.4`, `example.net`, `NXDOMAIN`) and the
 /// full `RCODE;TYPE;VALUE` form.
 fn parse_dnsrewrite(s: &str) -> Result<DnsRewrite, ParseError> {
+    // No value at all is `NOERROR` and no records -- an answer, not a
+    // cancellation. Captured from a running v0.107.79: `||a.example^$dnsrewrite`
+    // and `||a.example^$dnsrewrite=` both answer NOERROR with an empty answer
+    // section and report `RewriteRule`.
     if s.is_empty() {
-        return Ok(DnsRewrite::Exclude);
+        return Ok(DnsRewrite::RCode(0));
     }
 
     let parts: Vec<&str> = s.split(';').collect();
     match parts.as_slice() {
         [one] => {
             if let Some(rc) = rcode_from_str(one) {
-                // NOERROR alone means "do not rewrite".
-                return Ok(if rc == 0 {
-                    DnsRewrite::Exclude
-                } else {
-                    DnsRewrite::RCode(rc)
-                });
+                return Ok(DnsRewrite::RCode(rc));
             }
             if let Ok(ip) = one.parse::<IpAddr>() {
                 return Ok(DnsRewrite::Addr(ip));

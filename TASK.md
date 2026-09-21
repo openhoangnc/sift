@@ -55,7 +55,8 @@ Verification claims below are reproducible with `scripts/verify.sh` and
 - [x] Adblock rule parser: `||domain^`, `|`, `^`, `*`, `@@` exceptions, `/regex/`
 - [x] Hosts-file rules, including address-family selection for A/AAAA
 - [x] Modifiers: `$important`, `$badfilter`, `$dnstype`, `$client`, `$ctag`,
-      `$denyallow`, `$dnsrewrite`; HTTP-only modifiers accepted and ignored
+      `$denyallow`, `$dnsrewrite` and its `@@` exceptions; HTTP-only modifiers
+      accepted and ignored
 - [x] Pattern → regex translation mirroring urlfilter, including the two
       details that decide real results: bare patterns match the **hostname**
       rather than the pseudo-URL, and every pattern is case-insensitive
@@ -1581,6 +1582,66 @@ so a field wired to the wrong source reads another subsystem's number.
 
 **Not yet used to find anything.** It exists because the next climb should
 cost an hour rather than a day.
+
+---
+
+## Found comparing `$dnsrewrite` against a running build, and fixed
+
+A reading of the code suggested `@@||host^$dnsrewrite=1.2.3.4` was being
+*applied* here rather than treated as an exception. It was, and comparing 24
+cases against a running v0.107.79 — the published image, user rules set
+through the API, then `check_host` and a real query for each — found **twelve**
+of them answered differently. Two mistakes, both of which a reading of
+urlfilter's source would have got half right:
+
+- **An `@@…$dnsrewrite` rule is an exception, and this build applied it.**
+  `consider` routed every rule carrying a rewrite into the rewrite list
+  whatever its `allowlist` flag, so `@@||a.example^$dnsrewrite=1.2.3.4` sent
+  the client to 1.2.3.4 — the exact opposite of what someone writes that rule
+  for. It now removes matching rewrites and is never applied itself.
+
+  Which rewrites it removes was captured rather than inferred, and two details
+  are not what the source reads like. An exception with **no value** removes
+  rewrites of *any* value, and `=NOERROR` parses to the same thing, so
+  `@@||a.example^$dnsrewrite=NOERROR` removes `$dnsrewrite=1.2.3.4` rather
+  than only the rewrites that answer NOERROR. And the comparison is by the
+  **parsed value**, so `@@…$dnsrewrite=1.2.3.4` removes
+  `…$dnsrewrite=NOERROR;A;1.2.3.4`. `$important` decides the rest: an ordinary
+  exception leaves an `$important` rewrite alone, and an `$important`
+  exception takes it.
+
+- **`$dnsrewrite` with no value is a rewrite, not a cancellation.**
+  `$dnsrewrite`, `$dnsrewrite=` and `$dnsrewrite=NOERROR` each report
+  `RewriteRule` and answer NOERROR with an empty answer section. This build
+  parsed them to a `DnsRewrite::Exclude` of its own invention that cancelled
+  every rewrite for the host — so a rule meant to answer "nothing here"
+  silently disabled the rules beside it, and `||a.example^$dnsrewrite=1.2.3.4`
+  next to `||a.example^$dnsrewrite=NOERROR` resolved upstream where Go answers
+  1.2.3.4 citing both rules. The variant is gone; they parse to `RCode(0)`,
+  and in the resolver only a **non-zero** response code outranks the records
+  beside it.
+
+- **A rewrite of a host to itself is dropped**, as upstream's
+  `processDNSResultRewrites` drops `res.CanonName == host`:
+  `||a.example^$dnsrewrite=a.example` reports `NotFilteredNotFound` and
+  resolves normally.
+
+23 of the 24 cases now agree. `tests/compat/dnsrewrite_diff.py` is the
+comparison, wired into `scripts/verify.sh` beside `ratelimit_diff.py` because
+it too changes a setting — it replaces the user rules and puts the originals
+back. The captured answers are pinned in-repo by
+`crates/sift-filter/tests/dnsrewrite.rs` (14 cases, verdict and cited rules)
+and three resolver tests in `crates/sift-dns/src/resolver.rs` (the answer
+shape), so the suite covers them without a Go build.
+
+**The twenty-fourth is left, and recorded.** `||a.example^$dnsrewrite=b.example`
+gets `CNAME b.example` from both, but Go then resolves `b.example` and answers
+with *its* status — NXDOMAIN for a name that does not exist — where this build
+answers NOERROR and stops at the CNAME. Following a rewritten CNAME is a
+resolver change with a loop guard, a cache interaction and a query-log entry
+to decide, not a filtering one, so it is a task of its own rather than
+something to bundle into this. `dnsrewrite_diff.py` reports it as a known
+divergence and fails on anything else.
 
 ---
 
