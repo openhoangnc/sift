@@ -1392,6 +1392,62 @@ the allocator satisfies the second engine out of space it already holds; the
 high-water mark is the only honest way to see it, which is why `peak_rss` is
 in the snapshot.
 
+### The step a refresh leaves, and why it stays
+
+The deployment above was watched for fifteen hours with a sample every five
+minutes. The resident size went 281.5 MB to 363.4 MB, and **81% of that
+arrived in one hour** — the one holding `filter lists refreshed updated=13`
+and `updated=5`, 47 seconds apart. Thirteen hours of serving either side of it
+came to 14 MB, at a load of 3,539 distinct names in the whole query log. The
+queries were never it.
+
+Reproduced with that installation's own 37 lists — 2,220,598 rules, 50.3 MB of
+list text — in the published image, `linux/arm64`, static musl:
+
+| | resident | peak |
+|---|---:|---:|
+| loaded, settled | 280.6 MB | 413.9 MB |
+| after a refresh that changed 18 lists | 341.2 MB | 667.5 MB |
+| a minute later | 338.6 MB | 667.5 MB |
+| after a second such refresh | 337.9 MB | 667.5 MB |
+| after a third | 337.7 MB | 667.5 MB |
+
+**It does not accumulate.** The first refresh costs about 56 MB of resident
+size and every later one reuses that space rather than adding to it — which is
+what says the memory is free and musl is holding it, not that something here
+is still pointing at it. The peak settles at the first refresh too and does not
+move again. The reporting deployment's own numbers are the same shape: +66 MB
+on the step, a peak of 662.5 MB against this reproduction's 667.5 MB.
+
+Why the transient is that large is arithmetic: for the length of the rebuild
+both engines are live — 2.2M rules at 56 bytes is 124 MB of rules each — and
+so are both copies of the list text, because the live engine's rules point
+into the old bytes until it is replaced. Building the new engine after
+dropping the old would halve it and leave the resolver unfiltered for the ten
+seconds in between, which is not a trade worth making.
+
+**mimalloc was tried, and is worse.** The obvious answer to "musl does not
+give it back" is an allocator that does. Same lists, same image, same
+protocol, one build apart:
+
+| | musl | mimalloc |
+|---|---:|---:|
+| loaded, settled | 280.6 MB | 320.7 MB |
+| peak during a refresh | 667.5 MB | 808.1 MB |
+| settled after that refresh | 335.7 MB | 445.1 MB |
+| time to settle after loading | immediate | ~3 minutes |
+
+Worse on the baseline by 40 MB, on the peak by 140 MB and after a refresh by
+110 MB, and it holds the load transient at its peak for minutes before purging
+any of it. The change was reverted. musl's `mallocng` is doing the right thing
+here; the step is the cost of the rebuild, paid once.
+
+What that leaves: a refresh of a large list set costs a permanent-looking step
+in the resident size, and it is free space that the next refresh spends. An
+operator watching a container sees it and cannot tell it from a leak, which is
+what `peak_rss` and the counters in the snapshot are for — and, for anyone
+measuring the same thing again, so is the table above.
+
 ### Using it
 
 ```bash
