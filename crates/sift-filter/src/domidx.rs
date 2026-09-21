@@ -41,7 +41,10 @@ impl DomainIndex {
     /// FxHash-style multiply-xor: the keys are short ASCII domain names, and
     /// this is several times quicker over them than a general-purpose hash
     /// while spreading well enough for open addressing.
-    fn hash(key: &str) -> u64 {
+    ///
+    /// Reachable from the engine's builder because that is where a key is
+    /// hashed now -- see [`Self::build`].
+    pub(crate) fn hash(key: &str) -> u64 {
         const K: u64 = 0x517c_c1b7_2722_0a95;
 
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -74,12 +77,21 @@ impl DomainIndex {
         self.hashes.len() * 8 + self.vals.len() * 4 + self.spill.len() * 4
     }
 
-    /// Builds the index from `(domain, rule index)` pairs.
+    /// Builds the index from `(domain hash, rule index)` pairs.
     ///
     /// Pairs may repeat a domain; the rule indices for one domain keep the
     /// order they arrive in, which is the order the lists were read and so
     /// the order upstream would consider them.
-    pub fn build(pairs: Vec<(Box<str>, u32)>) -> Self {
+    ///
+    /// The *hash* rather than the domain, because the hash is the only thing
+    /// this ever wanted: a key is never stored, and a lookup is decided by
+    /// `hashes[i] == h` and the caller's verification. Taking the domains
+    /// meant the builder held an owned copy of every one of them until the
+    /// index was built -- 1.9M allocations on a real 37-list installation, to
+    /// produce 1.9M `u64`s and drop them again. Hashing where the rule is
+    /// parsed is the same arithmetic on the same bytes, and the string is
+    /// freed on the spot.
+    pub fn build(pairs: Vec<(u64, u32)>) -> Self {
         if pairs.is_empty() {
             return Self::default();
         }
@@ -96,9 +108,7 @@ impl DomainIndex {
         let mut groups: Vec<Vec<u32>> = Vec::new();
         let mut len = 0usize;
 
-        for (k, idx) in &pairs {
-            let h = Self::hash(k);
-
+        for &(h, idx) in &pairs {
             if (len + 1) * 10 > cap * 7 {
                 let (nh, nv, nc) = Self::grow(&hashes, &vals, cap);
                 hashes = nh;
@@ -111,17 +121,17 @@ impl DomainIndex {
             loop {
                 if vals[i] == EMPTY {
                     hashes[i] = h;
-                    vals[i] = *idx;
+                    vals[i] = idx;
                     len += 1;
                     break;
                 }
                 if hashes[i] == h {
                     // The same domain again: start or extend its group.
                     if vals[i] & SPILL == 0 {
-                        groups.push(vec![vals[i], *idx]);
+                        groups.push(vec![vals[i], idx]);
                         vals[i] = SPILL | (groups.len() - 1) as u32;
                     } else {
-                        groups[(vals[i] & !SPILL) as usize].push(*idx);
+                        groups[(vals[i] & !SPILL) as usize].push(idx);
                     }
                     break;
                 }
@@ -230,7 +240,7 @@ mod tests {
         DomainIndex::build(
             pairs
                 .iter()
-                .map(|(k, v)| ((*k).to_string().into_boxed_str(), *v))
+                .map(|(k, v)| (DomainIndex::hash(k), *v))
                 .collect(),
         )
     }
@@ -274,7 +284,7 @@ mod tests {
         let i = DomainIndex::build(
             pairs
                 .iter()
-                .map(|(k, v)| (k.clone().into_boxed_str(), *v))
+                .map(|(k, v)| (DomainIndex::hash(k), *v))
                 .collect(),
         );
 

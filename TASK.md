@@ -1448,6 +1448,46 @@ operator watching a container sees it and cannot tell it from a leak, which is
 what `peak_rss` and the counters in the snapshot are for — and, for anyone
 measuring the same thing again, so is the table above.
 
+### 55 MB of that peak was the builder's, and is gone
+
+The peak is dominated by two live engines and cannot go below that without a
+gap in filtering, but two things inside the build were paying for nothing.
+
+- **The domain index was handed 1.9M owned strings to produce 1.9M `u64`s.**
+  `DomainIndex` stores no keys — a lookup is decided by `hashes[i] == h` and
+  the caller's verification — so every domain the builder boxed was hashed
+  once and dropped. It takes `(u64, u32)` pairs now, hashed where the rule is
+  parsed, which is the same arithmetic on the same bytes and frees the string
+  on the spot.
+- **`shrink_to_fit` was spending an 83 MB copy to recover 1 MB.** It allocates
+  the exact size and copies, so the process holds both for the moment it runs.
+  Doubling had left the rule vector 1.1% over — 2,097,152 slots for 2,073,416
+  rules — and that copy landed inside the rebuild's peak. `shrink_if_wasteful`
+  shrinks only past an eighth of waste, which still collects the vectors that
+  really are half empty.
+
+Measured in the image on the same 37 lists, 2,220,397 rules, two containers
+from the same work directory doing the same refresh of 15 lists:
+
+| | v0.9.0 | after |
+|---|---:|---:|
+| loaded, settled | 284.3 MB | 281.8 MB |
+| peak loading | 413.9 MB | **355.9 MB** |
+| settled after a refresh | 327.8 MB | 327.4 MB |
+| peak during that refresh | 656.2 MB | **601.7 MB** |
+
+14% off the load peak and 8% off the refresh peak, with the settled size and
+every verdict unchanged — the differential test against Go's answers for 4,190
+domains covers that, and the whole suite passes.
+
+**A third change was tried and dropped.** The index gives each repeated domain
+a `Vec` of its own while building, ~500,000 of them; threading them through
+two flat arrays instead is perhaps 10-18 MB of the 600. `loadprofile` on macOS
+could not measure it — the same binary varied by 80 MB between runs — and it
+complicates a structure every query goes through, so it was reverted rather
+than guessed at. If it is ever wanted, measure it in a musl container against
+`VmHWM` and nowhere else.
+
 ### Using it
 
 ```bash

@@ -583,7 +583,7 @@ struct Builder {
     sources: Vec<Arc<str>>,
     net_text: Vec<TextRef>,
     hosts: Vec<HostRule>,
-    domain_pairs: Vec<(Box<str>, u32)>,
+    domain_pairs: Vec<(u64, u32)>,
     host_index: AHashMap<Box<str>, Refs>,
     shortcuts: AHashMap<String, Vec<u32>>,
     scan: Vec<u32>,
@@ -638,7 +638,10 @@ impl Builder {
 
         match (&r.pattern, shortcut) {
             (Pattern::DomainAnchor, Some(d)) => {
-                self.domain_pairs.push((d.into_boxed_str(), idx));
+                // Hashed here and the string dropped: the index keeps no
+                // keys, so holding one per rule until it was built was 1.9M
+                // live allocations for nothing.
+                self.domain_pairs.push((DomainIndex::hash(&d), idx));
             }
             (Pattern::Rx { .. }, Some(sc)) if sc.len() >= MIN_SHORTCUT_LEN => {
                 self.shortcuts.entry(sc).or_default().push(idx);
@@ -663,12 +666,13 @@ impl Builder {
     fn finish(mut self) -> RuleSet {
         // A `Vec` grows by doubling, so each of these can be holding up to
         // twice what it needs. They are written once and read for the life of
-        // the process, so hand the overshoot back.
-        self.net.shrink_to_fit();
-        self.net_text.shrink_to_fit();
-        self.hosts.shrink_to_fit();
-        self.scan.shrink_to_fit();
-        self.domain_pairs.shrink_to_fit();
+        // the process, so hand the overshoot back -- but only where there is
+        // an overshoot worth handing back, because shrinking copies.
+        shrink_if_wasteful(&mut self.net);
+        shrink_if_wasteful(&mut self.net_text);
+        shrink_if_wasteful(&mut self.hosts);
+        shrink_if_wasteful(&mut self.scan);
+        shrink_if_wasteful(&mut self.domain_pairs);
 
         let Builder {
             net,
@@ -695,6 +699,22 @@ impl Builder {
             badfilter,
             rules_count,
         }
+    }
+}
+
+/// Hands back a vector's overshoot, when there is enough of it to be worth
+/// the copy.
+///
+/// `shrink_to_fit` allocates the exact size and copies into it, so for the
+/// moment it runs the process holds both. On a real list set the rule vector
+/// lands 1.1% over -- 2,097,152 slots for 2,073,416 rules, because doubling
+/// stopped just past what was needed -- and shrinking it spent an 83 MB copy
+/// to recover 1 MB. That copy is inside the rebuild's peak, which is the
+/// thing a refresh is already straining. An eighth is the line: below it the
+/// overshoot is cheaper to keep than to collect.
+fn shrink_if_wasteful<T>(v: &mut Vec<T>) {
+    if v.capacity() > v.len() + v.len() / 8 {
+        v.shrink_to_fit();
     }
 }
 
