@@ -184,16 +184,7 @@ impl RuleSet {
             self.net.iter().filter(|r| r.opts.is_some()).count() * (size_of::<Options>() + 32);
 
         let host_structs = self.hosts.capacity() * size_of::<HostRule>();
-        let host_text: usize = self
-            .hosts
-            .iter()
-            .map(|h| {
-                h.text.len()
-                    + 32
-                    + h.hostnames.iter().map(|n| n.len() + 32).sum::<usize>()
-                    + h.hostnames.capacity() * size_of::<String>()
-            })
-            .sum();
+        let host_text: usize = self.hosts.iter().map(|h| h.text.len() + 32).sum();
 
         let idx = |m: &AHashMap<Box<str>, Refs>| -> (usize, usize, usize) {
             let keys: usize = m.keys().map(|k| k.len() + 32).sum();
@@ -673,8 +664,8 @@ impl Builder {
     fn add_host(&mut self, h: HostRule) {
         self.rules_count += 1;
         let idx = self.hosts.len() as u32;
-        for name in &h.hostnames {
-            push_ref(&mut self.host_index, name.clone().into_boxed_str(), idx);
+        for name in h.hostnames() {
+            push_ref(&mut self.host_index, name.into_boxed_str(), idx);
         }
         self.hosts.push(h);
     }
@@ -927,7 +918,7 @@ fn to_matched(set: &RuleSet, _r: &NetworkRule, idx: u32) -> MatchedRule {
 /// Converts a host rule into its reportable form.
 fn host_matched(h: &HostRule) -> MatchedRule {
     MatchedRule {
-        text: h.text.clone(),
+        text: h.text.to_string(),
         list_id: h.list_id,
         ip: Some(h.ip),
     }

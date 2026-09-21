@@ -46,16 +46,44 @@ pub struct ParsedNetwork {
 }
 
 /// A hosts-file entry: an address and the names it resolves.
+///
+/// The names are **not** stored. They are the line's own words, and keeping
+/// them cost a `Vec` and a `String` each on top of the text they were copied
+/// from -- on a real installation 147,175 of these carry about 12 MB of
+/// duplicate, and a rebuild holds two sets. [`Self::hostnames`] reads them
+/// back out of the text, which only the build and the tests ask for: a lookup
+/// goes through the host index, whose keys are those names already.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostRule {
     /// The original rule text.
-    pub text: String,
+    pub text: Box<str>,
     /// The address the names resolve to.
     pub ip: IpAddr,
-    /// The names this entry covers.
-    pub hostnames: Vec<String>,
     /// The list this rule came from.
     pub list_id: i64,
+}
+
+impl HostRule {
+    /// The names this entry covers, in the form the index files them under.
+    pub fn hostnames(&self) -> impl Iterator<Item = String> + '_ {
+        hostnames_of(&self.text)
+    }
+}
+
+/// The valid names on a hosts line, lowercased and without a trailing dot.
+///
+/// One definition, used to parse the line and to read it back, so the two
+/// cannot drift.
+fn hostnames_of(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split_once(|c: char| c.is_ascii_whitespace())
+        .map(|(_, rest)| rest)
+        .unwrap_or("")
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .split_ascii_whitespace()
+        .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|h| !h.is_empty() && sift_core::name::is_valid(h))
 }
 
 impl HostRule {
@@ -647,26 +675,16 @@ pub fn parse(line: &str, list_id: i64) -> Result<Rule, ParseError> {
 /// Parses a hosts-file line, returning `None` if it is not one.
 fn parse_host_rule(t: &str, list_id: i64) -> Option<HostRule> {
     // A hosts line starts with an address followed by whitespace.
-    let (first, rest) = t.split_once(|c: char| c.is_ascii_whitespace())?;
+    let (first, _) = t.split_once(|c: char| c.is_ascii_whitespace())?;
     let ip: IpAddr = first.parse().ok()?;
 
-    let hostnames: Vec<String> = rest
-        .split('#')
-        .next()
-        .unwrap_or("")
-        .split_ascii_whitespace()
-        .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
-        .filter(|h| !h.is_empty() && sift_core::name::is_valid(h))
-        .collect();
-
-    if hostnames.is_empty() {
-        return None;
-    }
+    // Parsed to be sure the line names something valid, then dropped: the
+    // text is kept and `hostnames` reads them back from it.
+    hostnames_of(t).next()?;
 
     Some(HostRule {
-        text: t.to_string(),
+        text: t.into(),
         ip,
-        hostnames,
         list_id,
     })
 }
@@ -1107,12 +1125,15 @@ mod tests {
     fn parses_hosts_lines() {
         let h = host("0.0.0.0 ads.example.com");
         assert_eq!(h.ip, "0.0.0.0".parse::<IpAddr>().unwrap());
-        assert_eq!(h.hostnames, ["ads.example.com"]);
+        assert_eq!(h.hostnames().collect::<Vec<_>>(), ["ads.example.com"]);
         assert!(h.is_blocking());
 
         // Multiple names and a trailing comment.
         let h = host("127.0.0.1 a.example.com b.example.com # local");
-        assert_eq!(h.hostnames, ["a.example.com", "b.example.com"]);
+        assert_eq!(
+            h.hostnames().collect::<Vec<_>>(),
+            ["a.example.com", "b.example.com"]
+        );
 
         // A non-unspecified address rewrites rather than blocks.
         let h = host("192.168.1.5 nas.lan");

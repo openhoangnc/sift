@@ -66,9 +66,14 @@ fn a_rule_without_modifiers_allocates_no_options() {
 
 #[test]
 fn a_host_rule_stays_small() {
+    // A hosts-format list is 147,175 rules on a real installation, and each
+    // one used to carry its names twice: once in the text and once in a
+    // `Vec<String>` beside it. They are read back out of the text now, so
+    // what is left is a boxed line, an address and a list identifier.
     assert!(
-        size_of::<HostRule>() <= 96,
-        "HostRule grew to {}",
-        size_of::<HostRule>()
+        size_of::<HostRule>() <= 48,
+        "HostRule grew to {} bytes; at 147,175 rules that is ~{} MB",
+        size_of::<HostRule>(),
+        size_of::<HostRule>() * 147_175 / 1_048_576
     );
 }

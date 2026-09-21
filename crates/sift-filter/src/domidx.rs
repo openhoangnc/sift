@@ -19,11 +19,23 @@ const SPILL: u32 = 1 << 31;
 /// stored separately, so this is unambiguous.
 const EMPTY: u32 = u32::MAX;
 
+/// The half of a hash a slot stores: the top, since the bottom picks the slot.
+const fn top(h: u64) -> u32 {
+    (h >> 32) as u32
+}
+
 /// Domain to rule indices, in open addressing.
 #[derive(Debug, Default)]
 pub struct DomainIndex {
-    /// Each slot's key hash; meaningless where `vals` says the slot is empty.
-    hashes: Box<[u64]>,
+    /// The top half of each slot's key hash; meaningless where `vals` says
+    /// the slot is empty.
+    ///
+    /// Half a hash, because the other half is the slot: a probe starts at the
+    /// low bits, so storing them again says nothing a hit has not already
+    /// proved. What is left is 32 bits against 2^21 slots, and a stray match
+    /// still has to get past the caller's verification -- which is there
+    /// because no keys are stored at all. Worth 8.4 MB of the table.
+    hashes: Box<[u32]>,
     /// Each slot's rule index, or a spill offset, or [`EMPTY`].
     vals: Box<[u32]>,
     /// Runs of rule indices for domains named by more than one rule, each a
@@ -74,7 +86,7 @@ impl DomainIndex {
 
     /// The bytes the index occupies, for reporting.
     pub fn footprint(&self) -> usize {
-        self.hashes.len() * 8 + self.vals.len() * 4 + self.spill.len() * 4
+        self.hashes.len() * 4 + self.vals.len() * 4 + self.spill.len() * 4
     }
 
     /// Builds the index from `(domain hash, rule index)` pairs.
@@ -144,7 +156,7 @@ impl DomainIndex {
         }
 
         let mask = cap - 1;
-        let mut hashes = vec![0u64; cap];
+        let mut hashes = vec![0u32; cap];
         let mut vals = vec![EMPTY; cap];
         let mut spill: Vec<u32> = Vec::with_capacity(spill_len);
 
@@ -161,7 +173,7 @@ impl DomainIndex {
                 slot = (slot + 1) & mask;
             }
 
-            hashes[slot] = h;
+            hashes[slot] = top(h);
             vals[slot] = if j - i == 1 {
                 // One rule: it lives in the slot itself.
                 pairs[i].1
@@ -200,6 +212,7 @@ impl DomainIndex {
         }
 
         let h = Self::hash(key);
+        let top = top(h);
         let mut i = (h as usize) & self.mask;
         loop {
             let v = self.vals[i];
@@ -207,7 +220,7 @@ impl DomainIndex {
                 return &[];
             }
 
-            if self.hashes[i] == h {
+            if self.hashes[i] == top {
                 let run = if v & SPILL == 0 {
                     std::slice::from_ref(&self.vals[i])
                 } else {

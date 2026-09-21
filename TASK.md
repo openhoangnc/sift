@@ -1486,13 +1486,26 @@ work directory doing the same refresh, `VmHWM` and nothing else.
   to say one of 37 things, which belongs to the source it was parsed from.
   2.07M rules make that 33 MB of engine, and a rebuild holds two.
 
+- **A hosts entry kept its names twice.** 147,175 of them carried a
+  `Vec<String>` of the very words their text already held — a `Vec` and a
+  `String` allocation each, about 12 MB of duplicate. `HostRule::hostnames`
+  reads them back out of the line, which only the build and the tests ask
+  for: a lookup goes through the host index, whose keys are those names
+  already. 80 bytes down to 48, and the heap beside them from 30.3 MB to
+  8.7 MB.
+- **The domain index stores half a hash.** A probe starts at the hash's low
+  bits, so storing them again in the slot says nothing a hit has not proved;
+  the top 32 are kept and the table is 8.4 MB lighter. A stray match still
+  has to pass the caller's verification, which is there because no keys are
+  stored at all.
+
 | | v0.9.0 | now |
 |---|---:|---:|
-| loaded, settled | 284.2 MB | **243.9 MB** |
-| peak loading | 413.9 MB | **300.1 MB** |
-| peak during a refresh of 10 of 37 lists | 662.4 MB | **519.0 MB** |
+| loaded, settled | 284.2 MB | **208.9 MB** |
+| peak loading | 413.9 MB | **265.3 MB** |
+| peak during a refresh of 10 of 37 lists | 662.4 MB | **448.6 MB** |
 
-27% off the load peak and 22% off the refresh peak, 40 MB off the steady size,
+36% off the load peak and 32% off the refresh peak, 75 MB off the steady size,
 and the verdicts unchanged — the differential test against Go's answers for
 4,190 domains covers that, and `sizes.rs` now fails if a rule grows past 24
 bytes. Each step was measured in the image against the commit before it, not
@@ -1504,6 +1517,10 @@ against v0.9.0, so the numbers add up rather than overlapping:
 | compiled expressions released before the rebuild | — | −11 MB (at 349 held) |
 | domain index built by sorting | −2 MB | −3 MB |
 | `NetworkRule` 40 bytes to 24 | −33 MB | −66 MB |
+| host rules without their duplicate names, half-width index hashes | −35 MB | −70 MB |
+
+The engine's own estimate of itself falls from 192.0 MB to 123.0 MB over
+those, which is the number the peak is twice.
 
 ### A claim in the last round was wrong: musl does not copy a growing vector
 
