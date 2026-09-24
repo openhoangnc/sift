@@ -31,7 +31,8 @@ pub enum Freshness {
 
 /// What a lookup found.
 pub struct Hit {
-    /// The stored response, with its TTLs adjusted for this caller.
+    /// The stored response, readdressed to the request and with its TTLs
+    /// adjusted for this caller.
     pub msg: Message,
     /// Whether the entry is still inside its TTL.
     pub freshness: Freshness,
@@ -47,12 +48,19 @@ pub struct Hit {
 /// The key identifying a cached response.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Key {
-    /// The question name, lowercased and without a trailing dot.
+    /// The question name, lowercased, in wire form: each label behind its
+    /// length, without the root's terminating zero.
+    ///
+    /// Not text, because rendering a name as text escapes it, and that was a
+    /// quarter of a cache hit.  The wire form is just as unambiguous, which
+    /// is the property that matters: `www.victim\.com.` and `www.victim.com.`
+    /// are different bytes, so a name crafted with a dot inside a label can
+    /// never be answered from, or fill, another name's entry.
     ///
     /// Shared rather than owned, because every entry holds its key twice --
     /// once in the map and once in the eviction order -- and the name is the
     /// only part of it on the heap.
-    pub name: Arc<str>,
+    pub name: Arc<[u8]>,
     /// The question type.
     pub qtype: u16,
     /// The question class.
@@ -78,13 +86,15 @@ impl Key {
     pub fn from_request(req: &Message) -> Option<Self> {
         let q = req.queries.first()?;
 
+        let mut name = Vec::with_capacity(q.name().len() + 1);
+        for label in q.name().iter() {
+            // A label is at most 63 bytes, which `Name` enforces.
+            name.push(u8::try_from(label.len()).ok()?);
+            name.extend(label.iter().map(u8::to_ascii_lowercase));
+        }
+
         Some(Key {
-            name: q
-                .name()
-                .to_ascii()
-                .trim_end_matches('.')
-                .to_ascii_lowercase()
-                .into(),
+            name: name.into(),
             qtype: q.query_type().into(),
             qclass: q.query_class().into(),
             dnssec_ok: crate::edns::wants_dnssec(req),
@@ -208,6 +218,13 @@ const COMPACT_SLACK: usize = 64;
 /// A sharded, size-bounded DNS cache.
 pub struct Cache {
     shards: Vec<Mutex<Shard>>,
+    /// What picks a key's shard.
+    ///
+    /// Randomly keyed, like each shard's map, because the names are chosen
+    /// by whoever is asking; and a different key from the maps', because a
+    /// shard whose keys all shared their low hash bits would crowd them into
+    /// a corner of its own table.
+    shard_hasher: ahash::RandomState,
     cfg: parking_lot::RwLock<Config>,
     /// What [`Entry::stored`] counts from.
     epoch: Instant,
@@ -215,7 +232,7 @@ pub struct Cache {
 
 /// One shard's state.
 struct Shard {
-    map: HashMap<Key, Entry>,
+    map: HashMap<Key, Entry, ahash::RandomState>,
     /// Keys in rough insertion order, used for eviction.
     ///
     /// Each slot carries the sequence number of the entry it was pushed for.
@@ -280,7 +297,7 @@ impl Cache {
         let shards = (0..SHARDS)
             .map(|_| {
                 Mutex::new(Shard {
-                    map: HashMap::new(),
+                    map: HashMap::default(),
                     order: std::collections::VecDeque::new(),
                     bytes: 0,
                     budget: per_shard,
@@ -291,6 +308,7 @@ impl Cache {
 
         Self {
             shards,
+            shard_hasher: ahash::RandomState::new(),
             cfg: parking_lot::RwLock::new(cfg),
             epoch: Instant::now(),
         }
@@ -330,18 +348,17 @@ impl Cache {
 
     /// Picks the shard for a key.
     fn shard_of(&self, k: &Key) -> &Mutex<Shard> {
-        use std::hash::{Hash, Hasher};
-        let mut h = ahash::AHasher::default();
-        k.hash(&mut h);
-
-        &self.shards[(h.finish() as usize) % SHARDS]
+        &self.shards[(self.shard_hasher.hash_one(k) as usize) % SHARDS]
     }
 
-    /// Looks a response up, adjusting its TTLs to the time already elapsed.
+    /// Looks up the answer to `req`, stored under `k`, adjusting its TTLs to
+    /// the time already elapsed and readdressing it to `req` as
+    /// [`crate::msg::readdress`] does.
     ///
     /// Returns `None` on a miss, or when the entry has expired and optimistic
     /// serving is off.
-    pub fn get(&self, k: &Key) -> Option<Hit> {
+    pub fn get(&self, k: &Key, req: &Message) -> Option<Hit> {
+        let asked = req.queries.first()?;
         // `Config` is `Copy`, so one acquisition covers every field the
         // lookup needs.
         let cfg = *self.cfg.read();
@@ -368,8 +385,11 @@ impl Cache {
         // Unpacked under the lock, because the entry is only borrowed from
         // it; a failure is a bug in the packing, and the entry goes rather
         // than failing the same way on every lookup.
-        let Some(mut msg) = e.msg.unpack() else {
-            tracing::warn!("a cached answer for {} did not unpack; dropping it", k.name);
+        let Some(mut msg) = e.msg.unpack(asked) else {
+            tracing::warn!(
+                "a cached answer for {} did not unpack; dropping it",
+                asked.name
+            );
             sh.remove(k);
 
             return None;
@@ -390,6 +410,7 @@ impl Cache {
             e.refreshing = true;
         }
         drop(sh);
+        crate::msg::readdress(req, &mut msg);
 
         if expired {
             // A running AdGuard Home stamps `cache_optimistic_answer_ttl` on
@@ -625,6 +646,25 @@ mod tests {
         m
     }
 
+    /// A request for the name `k` is keyed on.
+    fn ask(k: &Key) -> Message {
+        let mut labels = Vec::new();
+        let mut wire = &k.name[..];
+        while let [len, rest @ ..] = wire {
+            let (label, rest) = rest.split_at(usize::from(*len));
+            labels.push(label);
+            wire = rest;
+        }
+
+        let mut m = Message::query();
+        m.add_query(Query::query(
+            Name::from_labels(labels).unwrap(),
+            RecordType::from(k.qtype),
+        ));
+
+        m
+    }
+
     fn resp(name: &str, ttl: u32) -> Message {
         let mut m = crate::msg::reply(&req(name), ResponseCode::NoError);
         m.answers = vec![Record::from_rdata(
@@ -648,17 +688,20 @@ mod tests {
         assert_ne!(global, theirs);
         assert!(c.put(global.clone(), &resp("intranet.example.com.", 300)));
 
-        assert!(c.get(&global).is_some(), "the global entry is there");
         assert!(
-            c.get(&theirs).is_none(),
+            c.get(&global, &ask(&global)).is_some(),
+            "the global entry is there"
+        );
+        assert!(
+            c.get(&theirs, &ask(&theirs)).is_none(),
             "a client with its own upstreams must not be served it"
         );
 
         // And the two coexist rather than evicting each other.
         assert!(c.put(theirs.clone(), &resp("intranet.example.com.", 300)));
         assert_eq!(c.len(), 2);
-        assert!(c.get(&global).is_some());
-        assert!(c.get(&theirs).is_some());
+        assert!(c.get(&global, &ask(&global)).is_some());
+        assert!(c.get(&theirs, &ask(&theirs)).is_some());
     }
 
     #[test]
@@ -673,7 +716,7 @@ mod tests {
 
         assert_eq!(one, two);
         assert!(c.put(one, &resp("example.com.", 300)));
-        assert!(c.get(&two).is_some());
+        assert!(c.get(&two, &ask(&two)).is_some());
     }
 
     #[test]
@@ -692,13 +735,13 @@ mod tests {
         assert!(c.is_disabled());
         assert_eq!(c.len(), 0, "entries must not survive the cache being off");
         assert!(!c.put(k.clone(), &resp("example.com.", 300)));
-        assert!(c.get(&k).is_none());
+        assert!(c.get(&k, &ask(&k)).is_none());
 
         // And switching it back on works without a restart.
         c.set_config(Config::default());
         assert!(!c.is_disabled());
         assert!(c.put(k.clone(), &resp("example.com.", 300)));
-        assert!(c.get(&k).is_some());
+        assert!(c.get(&k, &ask(&k)).is_some());
     }
 
     #[test]
@@ -728,7 +771,7 @@ mod tests {
         let k = Key::from_request(&req("example.com.")).unwrap();
         assert!(c.put(k.clone(), &resp("example.com.", 300)));
 
-        let hit = c.get(&k).expect("should hit");
+        let hit = c.get(&k, &ask(&k)).expect("should hit");
         assert_eq!(hit.freshness, Freshness::Fresh);
         assert_eq!(hit.msg.answers.len(), 1);
         assert_eq!(c.len(), 1);
@@ -763,16 +806,30 @@ mod tests {
         let a = Key::from_request(&req("Example.COM.")).unwrap();
         let b = Key::from_request(&req("example.com.")).unwrap();
         assert_eq!(a, b);
-        assert_eq!(&*a.name, "example.com");
+        assert_eq!(&*a.name, b"\x07example\x03com");
+    }
+
+    #[test]
+    fn a_dot_inside_a_label_is_a_different_name() {
+        // `www.victim\.com.` is two labels under a top-level domain that does
+        // not exist, and its NXDOMAIN must never be what `www.victim.com.`
+        // is told.  Keys rendered as text told the two apart only because
+        // the text was escaped.
+        let crafted = Name::from_labels(vec![&b"www"[..], b"victim.com"]).unwrap();
+        let mut r = Message::query();
+        r.add_query(Query::query(crafted, RecordType::A));
+
+        assert_ne!(
+            Key::from_request(&r).unwrap(),
+            Key::from_request(&req("www.victim.com.")).unwrap()
+        );
     }
 
     #[test]
     fn a_miss_returns_nothing() {
         let c = Cache::new(Config::default());
-        assert!(
-            c.get(&Key::from_request(&req("absent.com.")).unwrap())
-                .is_none()
-        );
+        let r = req("absent.com.");
+        assert!(c.get(&Key::from_request(&r).unwrap(), &r).is_none());
     }
 
     #[test]
@@ -782,7 +839,7 @@ mod tests {
         let mut m = resp("example.com.", 300);
         m.metadata.response_code = ResponseCode::ServFail;
         assert!(!c.put(k.clone(), &m));
-        assert!(c.get(&k).is_none());
+        assert!(c.get(&k, &ask(&k)).is_none());
     }
 
     #[test]
@@ -816,7 +873,7 @@ mod tests {
         assert!(c.is_disabled());
         let k = Key::from_request(&req("example.com.")).unwrap();
         assert!(!c.put(k.clone(), &resp("example.com.", 300)));
-        assert!(c.get(&k).is_none());
+        assert!(c.get(&k, &ask(&k)).is_none());
     }
 
     #[test]
@@ -870,7 +927,7 @@ mod tests {
         c.put(k.clone(), &resp("example.com.", 300));
         c.backdate(&k, Duration::from_secs(400));
 
-        let hit = c.get(&k).expect("optimistic serving keeps it");
+        let hit = c.get(&k, &ask(&k)).expect("optimistic serving keeps it");
         assert_eq!(hit.freshness, Freshness::Stale);
         assert_eq!(hit.msg.answers[0].ttl, 7);
         assert!(hit.refresh, "and its caller is told to refresh it");
@@ -883,7 +940,7 @@ mod tests {
         c.put(k.clone(), &resp("example.com.", 300));
         c.backdate(&k, Duration::from_secs(400));
 
-        assert!(c.get(&k).is_none());
+        assert!(c.get(&k, &ask(&k)).is_none());
         assert_eq!(c.len(), 0, "and it is gone rather than kept");
     }
 
@@ -898,7 +955,7 @@ mod tests {
         c.put(k.clone(), &resp("example.com.", 300));
         c.backdate(&k, Duration::from_secs(3600));
 
-        assert!(c.get(&k).is_none());
+        assert!(c.get(&k, &ask(&k)).is_none());
     }
 
     #[test]
@@ -912,15 +969,18 @@ mod tests {
         c.put(k.clone(), &resp("example.com.", 300));
         c.backdate(&k, Duration::from_secs(400));
 
-        assert!(c.get(&k).expect("a hit").refresh, "the first claims it");
         assert!(
-            !c.get(&k).expect("a hit").refresh,
+            c.get(&k, &ask(&k)).expect("a hit").refresh,
+            "the first claims it"
+        );
+        assert!(
+            !c.get(&k, &ask(&k)).expect("a hit").refresh,
             "the rest are served the same stale answer and refresh nothing"
         );
 
         c.end_refresh(&k);
         assert!(
-            c.get(&k).expect("a hit").refresh,
+            c.get(&k, &ask(&k)).expect("a hit").refresh,
             "and the claim can be taken again once it is released"
         );
     }
@@ -937,14 +997,14 @@ mod tests {
         c.put(k.clone(), &resp("example.com.", 100));
         c.backdate(&k, Duration::from_secs(95));
 
-        let first = c.get(&k).expect("a hit");
+        let first = c.get(&k, &ask(&k)).expect("a hit");
         assert_eq!(first.freshness, Freshness::Fresh);
         assert!(
             !first.refresh,
             "a name asked for once is left to expire quietly"
         );
         assert!(
-            c.get(&k).expect("a hit").refresh,
+            c.get(&k, &ask(&k)).expect("a hit").refresh,
             "a second ask pays for the exchange"
         );
     }
@@ -960,7 +1020,7 @@ mod tests {
         c.backdate(&k, Duration::from_secs(10));
 
         for _ in 0..5 {
-            assert!(!c.get(&k).expect("a hit").refresh);
+            assert!(!c.get(&k, &ask(&k)).expect("a hit").refresh);
         }
     }
 
@@ -973,8 +1033,8 @@ mod tests {
         c.put(k.clone(), &resp("example.com.", 100));
         c.backdate(&k, Duration::from_secs(95));
 
-        assert!(!c.get(&k).expect("a hit").refresh);
-        assert!(!c.get(&k).expect("a hit").refresh);
+        assert!(!c.get(&k, &ask(&k)).expect("a hit").refresh);
+        assert!(!c.get(&k, &ask(&k)).expect("a hit").refresh);
     }
 
     #[test]
@@ -990,7 +1050,10 @@ mod tests {
         for _ in 0..10_000 {
             c.put(k.clone(), &resp("example.com.", 300));
             c.backdate(&k, Duration::from_secs(400));
-            assert!(c.get(&k).is_none(), "expired, and dropped by the lookup");
+            assert!(
+                c.get(&k, &ask(&k)).is_none(),
+                "expired, and dropped by the lookup"
+            );
         }
 
         assert_eq!(c.len(), 0, "the cache is empty");
@@ -1012,7 +1075,10 @@ mod tests {
 
         c.put(k.clone(), &resp("example.com.", 300));
         c.backdate(&k, Duration::from_secs(400));
-        assert!(c.get(&k).is_none(), "the lookup drops it, leaving its slot");
+        assert!(
+            c.get(&k, &ask(&k)).is_none(),
+            "the lookup drops it, leaving its slot"
+        );
 
         // Something else in the same shard, stored between the dead slot and
         // the live one, is what eviction should actually take.
@@ -1030,11 +1096,11 @@ mod tests {
         }
 
         assert!(
-            c.get(&k).is_some(),
+            c.get(&k, &ask(&k)).is_some(),
             "the entry stored last must survive its own dead slot"
         );
         assert!(
-            c.get(&ok).is_none(),
+            c.get(&ok, &ask(&ok)).is_none(),
             "the genuinely older entry is what goes instead"
         );
     }
@@ -1060,7 +1126,7 @@ mod tests {
         // hickory `Message` made an entry 208 bytes before its heap, which
         // was another 360 for one address.
         assert!(
-            size_of::<Entry>() <= 80,
+            size_of::<Entry>() <= 72,
             "Entry grew to {} bytes",
             size_of::<Entry>()
         );
@@ -1109,9 +1175,46 @@ mod tests {
         let k = Key::from_request(&req(q)).unwrap();
         assert!(c.put(k.clone(), &m));
 
-        let hit = c.get(&k).expect("a hit");
+        // Readdressed to whoever asked, and otherwise the same.
+        let asking = ask(&k);
+        let hit = c.get(&k, &asking).expect("a hit");
+        m.metadata.id = asking.metadata.id;
         assert_eq!(hit.msg.to_vec().unwrap(), m.to_vec().unwrap());
         assert_eq!(hit.msg.answers[1].name.to_ascii(), "Edge.CDN.example.net.");
+    }
+
+    #[test]
+    fn a_hit_is_addressed_to_the_request_not_the_one_that_filled_it() {
+        let c = Cache::new(Config::default());
+        let mut first = req("www.example.com.");
+        first.metadata.recursion_desired = true;
+        let mut stored = resp("www.example.com.", 300);
+        stored.metadata.recursion_desired = true;
+        let mut edns = hickory_proto::op::Edns::new();
+        edns.options_mut()
+            .insert(hickory_proto::rr::rdata::opt::EdnsOption::Unknown(
+                10,
+                vec![0xAA; 8],
+            ));
+        stored.edns = Some(edns);
+        let k = Key::from_request(&first).unwrap();
+        assert!(c.put(k.clone(), &stored));
+
+        let mut second = Message::query();
+        second.add_query(Query::query(
+            Name::from_ascii("WwW.eXaMpLe.CoM.").unwrap(),
+            RecordType::A,
+        ));
+        second.metadata.recursion_desired = false;
+        second.metadata.checking_disabled = true;
+        assert_eq!(Key::from_request(&second).unwrap(), k, "the same entry");
+
+        let hit = c.get(&k, &second).expect("a hit").msg;
+        assert_eq!(hit.metadata.id, second.metadata.id);
+        assert_eq!(hit.queries[0].name.to_ascii(), "WwW.eXaMpLe.CoM.");
+        assert!(!hit.metadata.recursion_desired);
+        assert!(hit.metadata.checking_disabled);
+        assert!(hit.edns.is_none(), "not the first asker's cookie");
     }
 
     #[test]

@@ -289,6 +289,27 @@ pub fn shape_to_request(req: &Message, resp: &mut Message) {
     edns::mirror_request(req, resp);
 }
 
+/// Readdresses an answer fetched for one request to another asking the same
+/// question: a cache hit, or a query that waited on an identical one already
+/// in flight.
+///
+/// The records are shared; what belonged to the exchange that fetched them
+/// becomes the asker's own.  That is the ID; the question exactly as the asker
+/// spelled it, since a client randomising the case of its names (DNS 0x20)
+/// checks it came back the same, and the key the answer was found under is
+/// lowercased; and the `RD` and `CD` bits, which a server echoes.  The OPT
+/// record is dropped, and [`shape_to_request`] builds the asker's own on the
+/// way out: the upstream's carried the options of the exchange that fetched
+/// it, and a cookie among them is the first asker's client cookie, which RFC
+/// 7873 5.3 has any other client discard the answer for.
+pub fn readdress(req: &Message, resp: &mut Message) {
+    resp.metadata.id = req.metadata.id;
+    resp.metadata.recursion_desired = req.metadata.recursion_desired;
+    resp.metadata.checking_disabled = req.metadata.checking_disabled;
+    resp.queries.clone_from(&req.queries);
+    resp.edns = None;
+}
+
 /// A `NOERROR` response carrying the given addresses, filtered to the question's
 /// address family.
 pub fn with_addrs(req: &Message, addrs: &[IpAddr], ttl: u32) -> Message {

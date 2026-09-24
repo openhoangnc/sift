@@ -767,7 +767,7 @@ impl Resolver {
             .filter(|_| crate::cache::is_cacheable_type(qtype))
             .map(|k| k.for_upstreams(eff.upstreams.clone()));
         if let Some(k) = &key
-            && let Some(hit) = self.cache.get(k)
+            && let Some(hit) = self.cache.get(k, req)
         {
             // An expired entry is only worth serving if it can be replaced.
             // Without a refresh worker the honest answer is the slow one, so
@@ -790,12 +790,10 @@ impl Resolver {
             }
 
             if serve {
-                let mut cached = hit.msg;
-                cached.metadata.id = req.metadata.id;
                 let (reason, rules) = allowed.clone().unwrap_or_default();
 
                 return finish(Outcome {
-                    action: Action::Respond(Box::new(cached)),
+                    action: Action::Respond(Box::new(hit.msg)),
                     reason,
                     rules,
                     cached: true,
@@ -890,7 +888,9 @@ impl Resolver {
         let leader = match pending_key.map(|k| self.pending.enter(k)) {
             Some(PendingEntry::Follow(w)) => {
                 let mut resp = w.wait().await?;
-                resp.metadata.id = req.metadata.id;
+                msg::readdress(req, &mut resp);
+                // The leader clamps its own copy after publishing it.
+                msg::clamp_ttls(&mut resp, settings.cache_ttl_min, settings.cache_ttl_max);
 
                 return Some((resp, None, ecs_text));
             }

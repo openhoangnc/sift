@@ -1665,22 +1665,22 @@ carries no unsafe code:
 
 | Answer | Before: real | Before: charged | After: real | After: charged |
 |---|---|---|---|---|
-| one `A` record, with OPT | 833 B | 384 B | 274 B | 268 B |
-| `CNAME` then two `A`, with OPT | 1,377 B | 576 B | 333 B | 327 B |
+| one `A` record, with OPT | 833 B | 384 B | 259 B | 257 B |
+| `CNAME` then two `A`, with OPT | 1,377 B | 576 B | 318 B | 316 B |
 
 An entry held a hickory `Message`, and `estimate_weight` charged a guess of 64
 bytes a record. A `Record` is 272 bytes whatever it holds, because `RData` is
 as large as its largest variant and `Name` carries a 32-byte inline buffer. So
 the default 4 MiB `cache_size` really held about 9 MB: 10,900 one-address
-answers at 833 bytes each. Packed, the same budget holds about 15,600 of them
-in 4.3 MB. That is 43% more answers in less than half the memory, and
-`cache.bytes` in `/control/debug/memory` now means what it says.
+answers at 833 bytes each. Packed, the same budget holds about 16,300 of them
+in 4.2 MB. That is half again as many answers in less than half the memory,
+and `cache.bytes` in `/control/debug/memory` now means what it says.
 
 What changed, in `crates/sift-dns/src/packed.rs` and `cache.rs`:
 
 - **Fixed-size buffers.** A response is one `Box<[u8]>` rather than four
   `Vec`s, because nothing is appended to an entry once it is stored.
-- **One list for all three sections.** Four `u16` counts say where each
+- **One list for all three sections.** Three `u16` counts say where each
   section ends.
 - **Record data in wire form**, so an `A` record costs its 4 bytes rather than
   the 184 of `RData`. Names inside the data are compressed against earlier
@@ -1693,36 +1693,93 @@ What changed, in `crates/sift-dns/src/packed.rs` and `cache.rs`:
 - **Narrow fields.** `Instant` + `Duration` became milliseconds since the
   cache's epoch (`u64`) and seconds (`u32`). `hits` is a `u8` capped at the
   only threshold anything reads, and `weight` is a `u32`. `Entry` went from
-  208 bytes to 80, and `an_entry_stays_small` guards it. The OPT record's
-  fixed six bytes sit beside the buffer, because almost every answer has one.
-- **The key's name is an `Arc<str>`.** Every entry holds its key twice, once
-  in the map and once in the eviction order, and the name was two separate
-  heap allocations.
+  208 bytes to 72, and `an_entry_stays_small` guards it.
+- **The key's name is shared, and in wire form.** Every entry holds its key
+  twice, once in the map and once in the eviction order, so the name is an
+  `Arc<[u8]>` rather than two separate strings. It is the lowercased wire
+  form rather than text, because rendering a name as text escapes it, and
+  that was a quarter of a hit. Wire form is just as unambiguous:
+  `www.victim\.com.` and `www.victim.com.` are different bytes, which is what
+  stops a crafted name from filling another name's entry with its NXDOMAIN.
+  `a_dot_inside_a_label_is_a_different_name` guards that.
 
-**Lossless, deliberately.** `Packed::unpack` returns the message that was
-packed, byte for byte. That includes the case of each owner name: elision
-compares with `eq_case`, because `Name`'s `==` ignores case. It also includes
-an extended response code's high bits, the OPT options in order, and a record
-with empty data read back as `Update0`, the way the wire reads it. A response
-carrying a TSIG signature is not cached. The tests in `packed.rs` compare the
-encoded bytes, since `Name` equality cannot catch a case change.
+**The answer is kept losslessly; the exchange is not.** Every record comes
+back byte for byte, including the case of each owner name: elision compares
+with `eq_case`, because `Name`'s `==` ignores case. The tests in `packed.rs`
+compare encoded bytes, since `Name` equality cannot catch a case change. The
+question and the OPT record are deliberately not kept, for the reason in the
+next section. A response without exactly one question, a signed one, or one
+whose response code needs an OPT record to carry it is refused. None of those
+is cached anyway: only `NOERROR` and `NXDOMAIN` are.
 
 **Times kept exact, deliberately.** Whole seconds would have been four bytes
 smaller, but an entry stored at 0.99 s would then expire at 1.0 s. An
 `optimistic.rs` test that stores a one-second TTL could flake on that.
 
-**The cost: a hit is slower.** Rebuilding the hickory `Message` the rest of
-the resolver works on takes 240–320 ns for a one-address answer, where
-cloning one took about 80 ns. Most of that is `Name::read` on the question.
-The whole lookup, key hashing and lock included, went from about 500 ns to
-about 700 ns at 50,000 entries, and from 600 to 950 for the chain; timings
-on the build machine varied by ±50 ns between runs. Two alternatives were
-measured and rejected. A whole DNS message as the stored form decodes in
-400 ns. Keeping the decoded question beside the buffer adds 80 bytes to
-every entry. The end-to-end cost against a UDP exchange was not measured.
-Cloudflare saw lookups get faster because they serve from their own format.
-Here every answer passes through a `Message` for shaping, truncation and
-the query log, so serving packed bytes directly would be a different change.
+**What a hit costs.** Counted in instructions with callgrind, because wall
+time on the build machine swung by ±100 ns between runs. Each count covers
+building the key and the lookup, over 2,000 entries:
+
+| Hit | Holding `Message`s | First packed version | Now |
+|---|---|---|---|
+| one `A` record | 4,248 | 6,831 | **3,473** |
+| `CNAME` then two `A` | 4,832 | 9,539 | 5,324 |
+
+The first packed version was slower than what it replaced, because every hit
+re-parsed the stored question's name. Three changes brought it back:
+
+- **The request's name is reused.** When the request spells the name the
+  way the stored one is spelled, which is almost always, that name is
+  cloned rather than parsed.
+- **The key is built from the labels**, not from `Name::to_ascii`.
+- **Keyed `ahash` for both the shard and the map.** The map used to hash
+  with std's SipHash. The shard is picked by a separately keyed hasher,
+  because keys that shared their low hash bits would crowd one corner of
+  their shard's table.
+
+Sections are also sized exactly now. Collecting through an `Option` iterator
+lost the count, so a one-record answer allocated room for four.
+
+A chain still costs more than it did, because its `CNAME` targets are parsed
+from the buffer. A whole DNS message as the stored form was measured and
+rejected: it decodes in 400 ns. The end-to-end cost against a UDP exchange was
+not measured.
+
+### Found while packing: a hit was addressed to whoever filled the entry
+
+A cache hit returned the stored message with only its ID changed, and so did a
+query that waited on an identical one in flight (`pending_requests`). Two
+things in that message belonged to the first asker rather than the answer:
+
+- **The question, spelled the first asker's way.** The cache key is
+  lowercased, so `WWW.example.com` could be answered with a question reading
+  `www.example.com`. A client that randomises the case of its names (DNS 0x20)
+  checks that the question comes back as it sent it, and rejects the answer
+  otherwise. The `RD` and `CD` bits were also the first asker's.
+- **The upstream's OPT options.** A client's EDNS cookie is forwarded
+  upstream, and the upstream echoes it, so the first asker's client cookie
+  was stored and then handed to everyone. RFC 7873 5.3 has any other client
+  discard an answer whose client cookie is not its own. `dig`, which sends a
+  cookie by default, prints `Client COOKIE mismatch`.
+
+`msg::readdress` now makes a shared answer the asker's own: its ID, its
+question as spelled, its `RD` and `CD`, and no OPT record. `shape_to_request`
+then builds the asker's own OPT from its request, as it already did for
+locally built answers. A waiter is also given its TTLs clamped to
+`cache_ttl_min` and `cache_ttl_max`. The leader clamps its own copy after
+publishing it, so waiters had been getting the unclamped TTLs.
+`a_coalesced_answer_is_addressed_to_each_asker` fails without the fix, and
+`a_hit_is_addressed_to_the_request_not_the_one_that_filled_it` covers the
+cache.
+
+**Not yet compared against a running build.** This follows the RFCs, and
+dnsproxy's cache as its source reads: `unpackItem` builds the reply with
+`SetRcode(req, …)`, which takes the ID, question, `RD` and `CD` from the
+request, and a comment there says OPT records are not returned from cache.
+That is inferred from source, which this project does not treat as enough.
+Before this is called matched, `verify.sh` should ask both servers the same
+name twice, in two spellings and with a cookie, and compare the second
+answers.
 
 ## Found comparing `$dnsrewrite` against a running build, and fixed
 

@@ -275,8 +275,17 @@ toggles, its own blocked services and its own safe search.
   bytes whatever it holds. Entries are packed by `sift-dns/src/packed.rs`:
   one buffer, record data in wire form, and owner names elided when they
   repeat one already in hand. Each entry is charged what it actually
-  occupies. The format is lossless, byte for byte and case for case. Keep it
-  that way, and keep `Entry` inside the size `an_entry_stays_small` allows.
+  occupies. The records are kept losslessly, byte for byte and case for case.
+  Keep it that way, and keep `Entry` inside the size `an_entry_stays_small`
+  allows.
+- **A shared answer is readdressed, not replayed.** A cache hit, and a query
+  that waited on an identical one in flight, go through `msg::readdress`. It
+  gives the asker its own ID, its question as it spelled it, and its `RD` and
+  `CD` bits, and it drops the upstream's OPT record. That record held the
+  first asker's EDNS cookie, and RFC 7873 has every other client discard an
+  answer carrying it. A cache key is the lowercased *wire* form of the name,
+  never text joined by dots: `www.victim\.com.` must not share an entry with
+  `www.victim.com.`.
 - **Reserved filter list IDs** match upstream's `rulelist.APIID`: `0` custom
   rules, `-1` the system hosts file, `-2` blocked services. The resolver maps
   these to the reason the web UI expects.

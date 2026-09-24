@@ -26,22 +26,25 @@
 //!   written once and pointed at afterwards, by the compression a DNS message
 //!   uses.
 //!
-//! The encoding is lossless, and deliberately so: [`Packed::unpack`] gives back
-//! the message that was packed, owner-name case included, so a cache hit
-//! answers exactly what the upstream said.  Nothing outside this process ever
-//! reads the format, which is why it is ours and not a DNS message: a message
-//! rebuilds every owner name from its labels, and parsing names is most of
-//! what unpacking costs: an elided name is a copy of one already in hand.
+//! What is kept is the *answer*, and the answer is kept losslessly: every
+//! record, owner-name case included, and the header's flags and code.  What
+//! belongs to the exchange that fetched it is not kept, because it belongs to
+//! somebody else by the time the entry is read: the question comes from the
+//! request being answered, and so does the OPT record, which
+//! [`crate::msg::readdress`] explains.  Nothing outside this process ever
+//! reads the format, which is why it is ours and not a DNS message: decoding
+//! a message rebuilds every owner name from its labels, and parsing names is
+//! most of what unpacking costs.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use hickory_proto::op::{Edns, Message, Metadata, Query};
+use hickory_proto::op::{Message, Metadata, Query};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordData, RecordType};
 use hickory_proto::serialize::binary::{
     BinDecodable, BinDecoder, BinEncodable, BinEncoder, Restrict,
 };
 
-/// Set on a record whose owner is the first question's name.
+/// Set on a record whose owner is the question's name.
 const OWNER_IS_QNAME: u8 = 1;
 
 /// Set on a record whose owner is the previous record's.
@@ -76,139 +79,113 @@ impl Recent {
 /// A response, packed for storage.
 #[derive(Clone, Debug)]
 pub(crate) struct Packed {
-    /// The header, as it was.  Its response code already includes the high
-    /// bits an OPT record carries, so nothing is merged back on the way out.
+    /// The header, as it was.
     metadata: Metadata,
-    /// How many questions, answers, authorities and additionals `bytes`
-    /// holds, in that order.
-    counts: [u16; 4],
-    /// The OPT record's fixed fields, when there is one.  Its options, if it
-    /// has any, are whatever of `bytes` follows the last section.
-    edns: Option<OptHead>,
-    /// The questions, then every record of every section, then the OPT
-    /// record's options.
+    /// How many answers, authorities and additionals `bytes` holds, in that
+    /// order.
+    counts: [u16; 3],
+    /// The question's name as the upstream spelled it, then every record of
+    /// every section.
+    ///
+    /// The name is kept, though the question is not, because the owners
+    /// elided against it must come back spelled the way they were.
     bytes: Box<[u8]>,
-}
-
-/// The part of an OPT record that is the same size in every response.
-///
-/// Kept beside the buffer rather than in it, because almost every answer
-/// carries an OPT record and most of those carry no options: building one from
-/// six bytes in hand is a fraction of decoding it as a record.
-#[derive(Clone, Copy, Debug)]
-struct OptHead {
-    rcode_high: u8,
-    version: u8,
-    flags: u16,
-    max_payload: u16,
 }
 
 impl Packed {
     /// Packs a response, or `None` for one that must not be stored.
     ///
-    /// A signed response is refused rather than stored without its
-    /// signature: the signature covers one exchange, and no upstream this
-    /// server speaks to signs its answers anyway.
+    /// Refused: a response without exactly one question, which is not an
+    /// answer to anything this server asks; a signed one, since the signature
+    /// covers one exchange and could not be kept without the rest of it; and
+    /// one whose response code needs an OPT record to carry it, since the
+    /// OPT record is not kept.  None of those is ever cached -- only
+    /// `NOERROR` and `NXDOMAIN` are -- so the refusals only keep this honest.
     pub(crate) fn pack(msg: &Message) -> Option<Self> {
-        if msg.signature.is_some() {
+        let [q] = msg.queries.as_slice() else {
+            return None;
+        };
+        if msg.signature.is_some() || msg.metadata.response_code.high() != 0 {
             return None;
         }
 
         let count = |n: usize| u16::try_from(n).ok();
         let counts = [
-            count(msg.queries.len())?,
             count(msg.answers.len())?,
             count(msg.authorities.len())?,
             count(msg.additionals.len())?,
         ];
 
-        let qname = msg.queries.first().map(|q| &q.name);
         let mut recent = Recent::default();
         let mut buf = Vec::new();
         let mut enc = BinEncoder::new(&mut buf);
-        for q in &msg.queries {
-            q.emit(&mut enc).ok()?;
-        }
+        q.name.emit(&mut enc).ok()?;
         for r in msg
             .answers
             .iter()
             .chain(&msg.authorities)
             .chain(&msg.additionals)
         {
-            emit_record(&mut enc, r, qname, &recent)?;
+            emit_record(&mut enc, r, Some(&q.name), &recent)?;
             recent.saw(r);
-        }
-        if let Some(e) = &msg.edns
-            && !e.options().options.is_empty()
-        {
-            e.options().emit(&mut enc).ok()?;
         }
 
         Some(Self {
             metadata: msg.metadata,
             counts,
-            edns: msg.edns.as_ref().map(|e| OptHead {
-                rcode_high: e.rcode_high(),
-                version: e.version(),
-                flags: (*e.flags()).into(),
-                max_payload: e.max_payload(),
-            }),
             bytes: buf.into_boxed_slice(),
         })
     }
 
-    /// Rebuilds the message that was packed.
+    /// Rebuilds the answer that was packed, as the answer to `asked`.
+    ///
+    /// Carries no OPT record, and only the header the answer came with: the
+    /// caller readdresses it to the request, as [`crate::msg::readdress`]
+    /// does.
     ///
     /// `None` only if the bytes do not decode, which would be a bug here
     /// rather than anything an upstream could cause: they were written by
     /// [`Packed::pack`] from a message that had already been decoded once.
-    pub(crate) fn unpack(&self) -> Option<Message> {
+    pub(crate) fn unpack(&self, asked: &Query) -> Option<Message> {
         let mut d = BinDecoder::new(&self.bytes);
-        let [queries, answers, authorities, additionals] = self.counts.map(usize::from);
+        let [answers, authorities, additionals] = self.counts.map(usize::from);
+
+        // Almost every request spells its name the way the one that filled
+        // the entry did, and then the name already in hand is the one the
+        // elided owners need.  Parsing it again was a sixth of a hit.
+        let qname = match spelled_at_start(&asked.name, &self.bytes) {
+            Some(len) => {
+                d.read_slice(len).ok()?;
+                asked.name.clone()
+            }
+            None => Name::read(&mut d).ok()?,
+        };
 
         // Not `Message::query`, which draws a random ID only to have it
         // overwritten: that was a tenth of the cost of a hit.
         let m = self.metadata;
         let mut msg = Message::new(m.id, m.message_type, m.op_code);
         msg.metadata = m;
-        msg.queries = (0..queries)
-            .map(|_| Query::read(&mut d).ok())
-            .collect::<Option<_>>()?;
+        msg.queries = vec![asked.clone()];
 
-        let qname = msg.queries.first().map(|q| q.name.clone());
+        let qname = Some(qname);
         let mut recent = Recent::default();
+        // Sized exactly, rather than collected: collecting through an
+        // `Option` loses the count, and a one-record answer grew room for
+        // four 272-byte records.
         let mut section = |n: usize| {
-            (0..n)
-                .map(|_| {
-                    let r = read_record(&mut d, qname.as_ref(), &recent)?;
-                    recent.saw(&r);
+            let mut records = Vec::with_capacity(n);
+            for _ in 0..n {
+                let r = read_record(&mut d, qname.as_ref(), &recent)?;
+                recent.saw(&r);
+                records.push(r);
+            }
 
-                    Some(r)
-                })
-                .collect::<Option<Vec<_>>>()
+            Some(records)
         };
         msg.answers = section(answers)?;
         msg.authorities = section(authorities)?;
         msg.additionals = section(additionals)?;
-
-        if let Some(head) = self.edns {
-            let mut edns = Edns::new();
-            edns.set_rcode_high(head.rcode_high)
-                .set_version(head.version)
-                .set_max_payload(head.max_payload);
-            *edns.flags_mut() = head.flags.into();
-
-            let rest = u16::try_from(d.len()).ok()?;
-            if rest > 0 {
-                let RData::OPT(options) =
-                    RData::read(&mut d, RecordType::OPT, Restrict::new(rest)).ok()?
-                else {
-                    return None;
-                };
-                *edns.options_mut() = options;
-            }
-            msg.edns = Some(edns);
-        }
 
         Some(msg)
     }
@@ -217,6 +194,24 @@ impl Packed {
     pub(crate) fn heap_len(&self) -> usize {
         self.bytes.len()
     }
+}
+
+/// How many bytes `name` takes at the start of `buf`, if `buf` spells it
+/// exactly so -- byte for byte, and so case for case.
+///
+/// The name at the start of the buffer is the first thing written, so it
+/// holds no compression pointer and can be compared label by label.
+fn spelled_at_start(name: &Name, buf: &[u8]) -> Option<usize> {
+    let mut at = 0;
+    for label in name.iter() {
+        let end = at + 1 + label.len();
+        if usize::from(*buf.get(at)?) != label.len() || buf.get(at + 1..end)? != label {
+            return None;
+        }
+        at = end;
+    }
+
+    (*buf.get(at)? == 0).then_some(at + 1)
 }
 
 /// Writes one record: a byte saying which name the owner repeats, if any, the
@@ -305,8 +300,8 @@ fn read_record(d: &mut BinDecoder<'_>, qname: Option<&Name>, recent: &Recent) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::op::{MessageType, ResponseCode};
-    use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
+    use hickory_proto::op::{Edns, MessageType, ResponseCode};
+    use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
     use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, SOA, TXT};
 
     fn name(s: &str) -> Name {
@@ -323,15 +318,21 @@ mod tests {
         m
     }
 
-    /// Packs and unpacks `m`, and checks that what comes back encodes to the
-    /// same bytes -- the one comparison that is case-sensitive, since
-    /// `Name`'s `==` is not.
+    /// Packs `m` and unpacks it for the question it was the answer to, and
+    /// checks that what comes back encodes to the same bytes, OPT record
+    /// aside -- the one comparison that is case-sensitive, since `Name`'s
+    /// `==` is not.
     fn round_trip(m: &Message) -> Message {
-        let back = Packed::pack(m).expect("packs").unpack().expect("unpacks");
+        let back = Packed::pack(m)
+            .expect("packs")
+            .unpack(&m.queries[0])
+            .expect("unpacks");
 
-        assert_eq!(back.to_vec().unwrap(), m.to_vec().unwrap());
+        let mut sent = m.clone();
+        sent.edns = None;
+        assert_eq!(back.to_vec().unwrap(), sent.to_vec().unwrap());
         assert_eq!(back.metadata, m.metadata);
-        assert_eq!(back.edns, m.edns);
+        assert_eq!(back.edns, None, "the OPT record belongs to the exchange");
 
         back
     }
@@ -348,10 +349,10 @@ mod tests {
 
         round_trip(&m);
 
-        // The question once, then a flag byte instead of the owner name, ten
+        // The name once, then a flag byte instead of the owner name, ten
         // bytes of type, class, TTL and length, and the address.
         let packed = Packed::pack(&m).unwrap();
-        assert_eq!(packed.heap_len(), 17 + 4 + 1 + 10 + 4);
+        assert_eq!(packed.heap_len(), 17 + 1 + 10 + 4);
     }
 
     #[test]
@@ -381,8 +382,8 @@ mod tests {
             "e13678.dscb.akamaiedge.net."
         );
 
-        // Each name after the first is a pointer to where it was written as
-        // the previous record's target, so the chain is not stored twice.
+        // Each owner after the first repeats the target before it, so the
+        // chain is not stored twice.
         let wire = m.to_vec().unwrap().len();
         assert!(
             Packed::pack(&m).unwrap().heap_len() < wire,
@@ -412,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn every_section_and_the_opt_record_survive() {
+    fn every_section_survives() {
         let q = "example.com.";
         let mut m = response(q, RecordType::MX);
         m.metadata.authentic_data = true;
@@ -437,9 +438,24 @@ mod tests {
             RData::AAAA(AAAA::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
         ));
 
+        let back = round_trip(&m);
+        assert_eq!(back.answers.len(), 2);
+        assert_eq!(back.authorities.len(), 1);
+        assert_eq!(back.additionals.len(), 1);
+    }
+
+    #[test]
+    fn the_upstreams_opt_record_is_not_kept() {
+        // Its options were the options of one exchange.  A cookie among them
+        // is the client cookie of whoever asked first, and RFC 7873 5.3 has
+        // any other client discard an answer carrying it.
+        let mut m = response("example.com.", RecordType::A);
         let mut edns = Edns::new();
         edns.set_max_payload(1232);
-        edns.set_dnssec_ok(true);
+        edns.options_mut().insert(EdnsOption::Unknown(
+            u16::from(EdnsCode::Cookie),
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+        ));
         edns.options_mut()
             .insert(EdnsOption::Subnet(ClientSubnet::new(
                 "192.0.2.0".parse().unwrap(),
@@ -448,24 +464,41 @@ mod tests {
             )));
         m.edns = Some(edns);
 
-        let back = round_trip(&m);
-        assert_eq!(back.answers.len(), 2);
-        assert_eq!(back.authorities.len(), 1);
-        assert_eq!(back.additionals.len(), 1);
+        round_trip(&m);
     }
 
     #[test]
-    fn an_extended_response_code_keeps_its_high_bits() {
+    fn the_question_is_the_one_asked() {
+        // A client randomising the case of its names (DNS 0x20) checks the
+        // question comes back as it sent it.  The entry was filled by a
+        // client that spelled it another way.
+        let mut m = response("www.example.com.", RecordType::A);
+        m.answers.push(Record::from_rdata(
+            name("www.example.com."),
+            60,
+            RData::A(A::new(192, 0, 2, 1)),
+        ));
+        let packed = Packed::pack(&m).unwrap();
+
+        let asked = Query::query(Name::from_ascii("wWw.ExAmPlE.cOm.").unwrap(), RecordType::A);
+        let back = packed.unpack(&asked).unwrap();
+
+        assert_eq!(back.queries[0].name.to_ascii(), "wWw.ExAmPlE.cOm.");
+        assert_eq!(
+            back.answers[0].name.to_ascii(),
+            "www.example.com.",
+            "the records are the upstream's, as it spelled them"
+        );
+    }
+
+    #[test]
+    fn a_response_whose_code_needs_the_opt_record_is_refused() {
         // BADVERS is 16: the header holds its low four bits and the OPT
-        // record the rest, and both have to come back.
+        // record the rest, and the OPT record is not kept.
         let mut m = response("example.com.", RecordType::A);
         m.metadata.response_code = ResponseCode::BADVERS;
-        let mut edns = Edns::new();
-        edns.set_rcode_high(ResponseCode::BADVERS.high());
-        m.edns = Some(edns);
 
-        let back = round_trip(&m);
-        assert_eq!(back.metadata.response_code, ResponseCode::BADVERS);
+        assert!(Packed::pack(&m).is_none());
     }
 
     #[test]
@@ -491,6 +524,13 @@ mod tests {
         let back = round_trip(&m);
         assert_eq!(back.answers[0].name.to_ascii(), "www.example.com.");
         assert_eq!(back.answers[1].name.to_ascii(), "WwW.Example.COM.");
+
+        // And they keep it when the request is spelled another way, which is
+        // the path that parses the stored name rather than reusing the
+        // request's.
+        let asked = Query::query(name("www.example.com."), RecordType::A);
+        let back = Packed::pack(&m).unwrap().unpack(&asked).unwrap();
+        assert_eq!(back.answers[1].name.to_ascii(), "WwW.Example.COM.");
     }
 
     #[test]
@@ -503,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn a_response_without_a_question_still_packs() {
+    fn a_response_without_exactly_one_question_is_refused() {
         let mut m = Message::query();
         m.metadata.message_type = MessageType::Response;
         m.answers.push(Record::from_rdata(
@@ -511,7 +551,27 @@ mod tests {
             60,
             RData::A(A::new(192, 0, 2, 1)),
         ));
+        assert!(Packed::pack(&m).is_none(), "none");
 
-        round_trip(&m);
+        m.add_query(Query::query(name("example.com."), RecordType::A));
+        m.add_query(Query::query(name("example.net."), RecordType::A));
+        assert!(Packed::pack(&m).is_none(), "two");
+    }
+
+    #[test]
+    fn the_stored_name_is_matched_byte_for_byte() {
+        let mut buf = Vec::new();
+        name("www.example.com.")
+            .emit(&mut BinEncoder::new(&mut buf))
+            .unwrap();
+
+        assert_eq!(spelled_at_start(&name("www.example.com."), &buf), Some(17));
+        assert_eq!(
+            spelled_at_start(&Name::from_ascii("WWW.example.com.").unwrap(), &buf),
+            None
+        );
+        assert_eq!(spelled_at_start(&name("www.example.co."), &buf), None);
+        assert_eq!(spelled_at_start(&name("example.com."), &buf), None);
+        assert_eq!(spelled_at_start(&name("www.example.com."), &buf[..9]), None);
     }
 }

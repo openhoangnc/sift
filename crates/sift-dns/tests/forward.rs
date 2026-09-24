@@ -566,6 +566,60 @@ async fn identical_requests_in_flight_are_coalesced() {
 }
 
 #[tokio::test]
+async fn a_coalesced_answer_is_addressed_to_each_asker() {
+    // The waiters used to be handed the leader's answer with only the ID
+    // changed: its question, spelled the way the leader spelled it, which a
+    // client randomising the case of its names (DNS 0x20) rejects.
+    let (server, seen) = upstream("192.0.2.1".parse().unwrap(), Duration::from_millis(150)).await;
+    let r = Arc::new(
+        resolver(
+            server,
+            Settings {
+                pending_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await,
+    );
+
+    let spellings = [
+        "example.com.",
+        "EXAMPLE.com.",
+        "eXaMpLe.CoM.",
+        "Example.Com.",
+    ];
+    let mut set = tokio::task::JoinSet::new();
+    for (i, spelled) in spellings.into_iter().enumerate() {
+        let r = r.clone();
+        let mut req = request("example.com.");
+        req.metadata.id = 0x1000 + i as u16;
+        req.queries[0] = Query::query(Name::from_ascii(spelled).expect("a name"), RecordType::A);
+        set.spawn(async move {
+            let out = r.resolve(&req, Proto::Udp, &lan_client()).await;
+            (req, out)
+        });
+    }
+
+    while let Some(done) = set.join_next().await {
+        let (req, out) = done.expect("the task should not panic");
+        let Action::Respond(m) = &out.action else {
+            panic!("no answer for {:?}", req.queries[0].name());
+        };
+        assert_eq!(m.metadata.id, req.metadata.id);
+        assert_eq!(
+            m.queries[0].name().to_ascii(),
+            req.queries[0].name().to_ascii(),
+            "each asker gets its own question back"
+        );
+    }
+    assert_eq!(
+        seen.count.load(Ordering::SeqCst),
+        1,
+        "and they shared one exchange"
+    );
+}
+
+#[tokio::test]
 async fn without_coalescing_every_request_goes_upstream() {
     let (server, seen) = upstream("192.0.2.1".parse().unwrap(), Duration::from_millis(150)).await;
     let r = Arc::new(resolver(server, Settings::default()).await);
