@@ -103,7 +103,9 @@ Verification claims below are reproducible with `scripts/verify.sh` and
 - [x] Upstream modes: load balance (latency-ranked), parallel, fastest address
 - [x] Fallback resolvers
 - [x] Response cache: sized in bytes, sharded, TTL bounds, keyed on the EDNS
-      `DO` bit so a validating client is never served a stripped answer
+      `DO` bit so a validating client is never served a stripped answer.
+      Entries are packed and charged what they occupy — see *The response
+      cache, packed*
 - [x] **Optimistic caching**: an expired entry still inside
       `cache_optimistic_max_age` is served at once, stamped with
       `cache_optimistic_answer_ttl`, and fetched again out of band. Measured
@@ -1648,6 +1650,79 @@ so a field wired to the wrong source reads another subsystem's number.
 cost an hour rather than a day.
 
 ---
+
+## The response cache, packed
+
+Prompted by Cloudflare's write-up of the cache behind 1.1.1.1 ("How we saved
+100 terabytes of memory by optimizing 1.1.1.1's DNS cache", 2026), which took
+a typical entry from 953 bytes to 420 with five changes to a Rust cache. All
+five apply here, and measuring before changing anything turned up a bug the
+article does not have: **the cache's size accounting was wrong**.
+
+Measured with a counting global allocator over 50,000 entries in a release
+build. The harness was a scratch file and was not committed, because the tree
+carries no unsafe code:
+
+| Answer | Before: real | Before: charged | After: real | After: charged |
+|---|---|---|---|---|
+| one `A` record, with OPT | 833 B | 384 B | 274 B | 268 B |
+| `CNAME` then two `A`, with OPT | 1,377 B | 576 B | 333 B | 327 B |
+
+An entry held a hickory `Message`, and `estimate_weight` charged a guess of 64
+bytes a record. A `Record` is 272 bytes whatever it holds, because `RData` is
+as large as its largest variant and `Name` carries a 32-byte inline buffer. So
+the default 4 MiB `cache_size` really held about 9 MB: 10,900 one-address
+answers at 833 bytes each. Packed, the same budget holds about 15,600 of them
+in 4.3 MB. That is 43% more answers in less than half the memory, and
+`cache.bytes` in `/control/debug/memory` now means what it says.
+
+What changed, in `crates/sift-dns/src/packed.rs` and `cache.rs`:
+
+- **Fixed-size buffers.** A response is one `Box<[u8]>` rather than four
+  `Vec`s, because nothing is appended to an entry once it is stored.
+- **One list for all three sections.** Four `u16` counts say where each
+  section ends.
+- **Record data in wire form**, so an `A` record costs its 4 bytes rather than
+  the 184 of `RData`. Names inside the data are compressed against earlier
+  names in the buffer, the way a DNS message does it.
+- **Owner names elided.** One byte says which name the owner repeats: the
+  question's name, the previous record's owner, or the previous `CNAME`'s
+  target. A chain is therefore stored as its targets alone. The article
+  elides only the question's name. The other two cases are ours, because
+  parsing names is most of what unpacking costs.
+- **Narrow fields.** `Instant` + `Duration` became milliseconds since the
+  cache's epoch (`u64`) and seconds (`u32`). `hits` is a `u8` capped at the
+  only threshold anything reads, and `weight` is a `u32`. `Entry` went from
+  208 bytes to 80, and `an_entry_stays_small` guards it. The OPT record's
+  fixed six bytes sit beside the buffer, because almost every answer has one.
+- **The key's name is an `Arc<str>`.** Every entry holds its key twice, once
+  in the map and once in the eviction order, and the name was two separate
+  heap allocations.
+
+**Lossless, deliberately.** `Packed::unpack` returns the message that was
+packed, byte for byte. That includes the case of each owner name: elision
+compares with `eq_case`, because `Name`'s `==` ignores case. It also includes
+an extended response code's high bits, the OPT options in order, and a record
+with empty data read back as `Update0`, the way the wire reads it. A response
+carrying a TSIG signature is not cached. The tests in `packed.rs` compare the
+encoded bytes, since `Name` equality cannot catch a case change.
+
+**Times kept exact, deliberately.** Whole seconds would have been four bytes
+smaller, but an entry stored at 0.99 s would then expire at 1.0 s. An
+`optimistic.rs` test that stores a one-second TTL could flake on that.
+
+**The cost: a hit is slower.** Rebuilding the hickory `Message` the rest of
+the resolver works on takes 240–320 ns for a one-address answer, where
+cloning one took about 80 ns. Most of that is `Name::read` on the question.
+The whole lookup, key hashing and lock included, went from about 500 ns to
+about 700 ns at 50,000 entries, and from 600 to 950 for the chain; timings
+on the build machine varied by ±50 ns between runs. Two alternatives were
+measured and rejected. A whole DNS message as the stored form decodes in
+400 ns. Keeping the decoded question beside the buffer adds 80 bytes to
+every entry. The end-to-end cost against a UDP exchange was not measured.
+Cloudflare saw lookups get faster because they serve from their own format.
+Here every answer passes through a `Message` for shaping, truncation and
+the query log, so serving packed bytes directly would be a different change.
 
 ## Found comparing `$dnsrewrite` against a running build, and fixed
 

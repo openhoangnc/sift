@@ -271,6 +271,12 @@ toggles, its own blocked services and its own safe search.
   ~180,000 of them. When the modifiers were stored inline the struct was 296
   bytes and the engine used *more* memory than Go.
   `crates/sift-filter/tests/sizes.rs` fails if the layout regresses.
+- **The response cache does not hold `Message`s.** A hickory `Record` is 272
+  bytes whatever it holds. Entries are packed by `sift-dns/src/packed.rs`:
+  one buffer, record data in wire form, and owner names elided when they
+  repeat one already in hand. Each entry is charged what it actually
+  occupies. The format is lossless, byte for byte and case for case. Keep it
+  that way, and keep `Entry` inside the size `an_entry_stays_small` allows.
 - **Reserved filter list IDs** match upstream's `rulelist.APIID`: `0` custom
   rules, `-1` the system hosts file, `-2` blocked services. The resolver maps
   these to the reason the web UI expects.

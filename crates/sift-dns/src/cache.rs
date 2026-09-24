@@ -2,6 +2,12 @@
 //!
 //! Sized in bytes to match `cache_size` in the config, and sharded so that
 //! concurrent queries rarely contend on the same lock.
+//!
+//! Responses are held packed ([`crate::packed`]) rather than as hickory
+//! `Message`s, and each entry is charged what it actually occupies.  Holding
+//! the message cost 833 bytes of heap for a one-address answer while the
+//! budget was charged 384 for it, so `cache_size` was exceeded by more than
+//! twice over before a single entry was evicted.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -11,6 +17,8 @@ use std::time::{Duration, Instant};
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::RecordType;
 use parking_lot::Mutex;
+
+use crate::packed::Packed;
 
 /// How a cached entry stands against its TTL.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -40,7 +48,11 @@ pub struct Hit {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Key {
     /// The question name, lowercased and without a trailing dot.
-    pub name: String,
+    ///
+    /// Shared rather than owned, because every entry holds its key twice --
+    /// once in the map and once in the eviction order -- and the name is the
+    /// only part of it on the heap.
+    pub name: Arc<str>,
     /// The question type.
     pub qtype: u16,
     /// The question class.
@@ -71,7 +83,8 @@ impl Key {
                 .name()
                 .to_ascii()
                 .trim_end_matches('.')
-                .to_ascii_lowercase(),
+                .to_ascii_lowercase()
+                .into(),
             qtype: q.query_type().into(),
             qclass: q.query_class().into(),
             dnssec_ok: crate::edns::wants_dnssec(req),
@@ -87,27 +100,37 @@ impl Key {
         self
     }
 
-    /// A rough byte cost for accounting.
-    fn weight(&self) -> usize {
-        self.name.len()
-            + self.upstreams.as_ref().map_or(0, |u| u.len())
-            + std::mem::size_of::<Self>()
+    /// What the key's name occupies on the heap: its bytes and the two
+    /// reference counts in front of them.
+    ///
+    /// The upstreams are not charged: one string is shared by every entry
+    /// of every client configured with it.
+    fn heap_len(&self) -> usize {
+        self.name.len() + 2 * size_of::<usize>()
     }
 }
 
 /// A cached response.
+///
+/// Every field is as narrow as what it holds allows, because the cache holds
+/// as many of these as `cache_size` fits: `an_entry_stays_small` pins the size.
 #[derive(Clone, Debug)]
 struct Entry {
-    /// The stored message, with TTLs as received.
-    msg: Message,
-    /// When the entry was stored.
-    stored: Instant,
-    /// The TTL the entry was stored with.
-    ttl: Duration,
-    /// The approximate size of the entry in bytes.
-    weight: usize,
-    /// How many times the entry has been served.
-    hits: u32,
+    /// The stored response, with TTLs as received.
+    msg: Packed,
+    /// When the entry was stored, in milliseconds since the cache's epoch.
+    ///
+    /// Half an `Instant`, and still exact enough that nothing expires a
+    /// moment early.  Ages are taken with wrapping arithmetic, so a test can
+    /// move this back past the epoch.
+    stored: u64,
+    /// The TTL the entry was stored with, in seconds.
+    ttl: u32,
+    /// What the entry occupies, in bytes.  See [`charge`].
+    weight: u32,
+    /// How many times the entry has been served, up to [`REFRESH_MIN_HITS`]
+    /// -- nothing asks for more than whether it got that far.
+    hits: u8,
     /// Whether a background refresh of this entry is already running.
     refreshing: bool,
     /// The eviction slot this entry owns.
@@ -120,14 +143,15 @@ struct Entry {
 }
 
 impl Entry {
-    /// Reports how much time has passed since the entry was stored.
-    fn age(&self, now: Instant) -> Duration {
-        now.saturating_duration_since(self.stored)
+    /// Reports how much time has passed since the entry was stored, given
+    /// the time now in milliseconds since the cache's epoch.
+    fn age(&self, now: u64) -> Duration {
+        Duration::from_millis(now.wrapping_sub(self.stored))
     }
 
-    /// Reports whether the entry is past its TTL.
-    fn is_expired(&self, now: Instant) -> bool {
-        self.age(now) >= self.ttl
+    /// The TTL the entry was stored with.
+    fn ttl(&self) -> Duration {
+        Duration::from_secs(u64::from(self.ttl))
     }
 }
 
@@ -173,7 +197,7 @@ const SHARDS: usize = 16;
 ///
 /// A refresh costs an upstream exchange, so a name asked for exactly once --
 /// most of them -- is left to expire quietly.
-const REFRESH_MIN_HITS: u32 = 2;
+const REFRESH_MIN_HITS: u8 = 2;
 
 /// How many dead eviction slots a shard tolerates before compacting.
 ///
@@ -185,6 +209,8 @@ const COMPACT_SLACK: usize = 64;
 pub struct Cache {
     shards: Vec<Mutex<Shard>>,
     cfg: parking_lot::RwLock<Config>,
+    /// What [`Entry::stored`] counts from.
+    epoch: Instant,
 }
 
 /// One shard's state.
@@ -216,9 +242,19 @@ impl Shard {
             // that has its own slot further along.
             let live = self.map.get(&k).is_some_and(|e| e.seq == seq);
             if live && let Some(e) = self.map.remove(&k) {
-                self.bytes = self.bytes.saturating_sub(e.weight);
+                self.bytes = self.bytes.saturating_sub(e.weight as usize);
             }
         }
+    }
+
+    /// Drops one entry outside of eviction.
+    fn remove(&mut self, k: &Key) {
+        if let Some(e) = self.map.remove(k) {
+            self.bytes = self.bytes.saturating_sub(e.weight as usize);
+        }
+        // The entry's slot in `order` outlives it, and nothing else would
+        // ever collect it on a shard that stays under its budget.
+        self.compact_order();
     }
 
     /// Drops eviction slots that no longer name a live entry.
@@ -256,7 +292,13 @@ impl Cache {
         Self {
             shards,
             cfg: parking_lot::RwLock::new(cfg),
+            epoch: Instant::now(),
         }
+    }
+
+    /// The time now, in milliseconds since the cache's epoch.
+    fn now(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Replaces the configuration on a running cache.
@@ -307,42 +349,48 @@ impl Cache {
             return None;
         }
 
-        let now = Instant::now();
+        let now = self.now();
         let mut sh = self.shard_of(k).lock();
         let e = sh.map.get_mut(k)?;
 
         let age = e.age(now);
-        let expired = e.is_expired(now);
+        let ttl = e.ttl();
+        let expired = age >= ttl;
 
         // An expired entry is dropped unless optimistic serving is on and it
         // is still inside the stale window.
         if expired && (!cfg.optimistic || age > cfg.optimistic_max_age) {
-            let weight = e.weight;
-            sh.map.remove(k);
-            sh.bytes = sh.bytes.saturating_sub(weight);
-            // The entry's slot in `order` outlives it, and nothing else would
-            // ever collect it on a shard that stays under its budget.
-            sh.compact_order();
+            sh.remove(k);
 
             return None;
         }
 
-        e.hits = e.hits.saturating_add(1);
+        // Unpacked under the lock, because the entry is only borrowed from
+        // it; a failure is a bug in the packing, and the entry goes rather
+        // than failing the same way on every lookup.
+        let Some(mut msg) = e.msg.unpack() else {
+            tracing::warn!("a cached answer for {} did not unpack; dropping it", k.name);
+            sh.remove(k);
+
+            return None;
+        };
+
+        e.hits = e.hits.saturating_add(1).min(REFRESH_MIN_HITS);
 
         // Refreshing shortly before the TTL runs out keeps a popular name
         // from being served stale at all.  It is worth an upstream exchange
         // only for a name that has been asked for more than once.
-        let remaining = e.ttl.saturating_sub(age);
+        let remaining = ttl.saturating_sub(age);
         let expiring = cfg.optimistic
             && e.hits >= REFRESH_MIN_HITS
-            && remaining <= (e.ttl / 10).max(Duration::from_secs(1));
+            && remaining <= (ttl / 10).max(Duration::from_secs(1));
 
         let refresh = (expired || expiring) && !e.refreshing;
         if refresh {
             e.refreshing = true;
         }
+        drop(sh);
 
-        let mut msg = e.msg.clone();
         if expired {
             // A running AdGuard Home stamps `cache_optimistic_answer_ttl` on
             // an optimistically served answer rather than counting down from
@@ -388,7 +436,11 @@ impl Cache {
             return false;
         };
 
-        let weight = estimate_weight(msg) + k.weight();
+        let Some(packed) = Packed::pack(msg) else {
+            return false;
+        };
+
+        let weight = charge(&k, &packed);
         let mut sh = self.shard_of(&k).lock();
 
         // Oversized single entries are simply not cached.
@@ -402,16 +454,17 @@ impl Cache {
         if let Some(old) = sh.map.insert(
             k.clone(),
             Entry {
-                msg: msg.clone(),
-                stored: Instant::now(),
+                msg: packed,
+                stored: self.now(),
                 ttl,
-                weight,
+                // A message is at most 64 KiB, so its charge always fits.
+                weight: u32::try_from(weight).unwrap_or(u32::MAX),
                 hits: 0,
                 refreshing: false,
                 seq,
             },
         ) {
-            sh.bytes = sh.bytes.saturating_sub(old.weight);
+            sh.bytes = sh.bytes.saturating_sub(old.weight as usize);
         }
         // Always a new slot, even when replacing: finding the old one would
         // be a linear scan, and the sequence number makes it harmless to
@@ -425,9 +478,9 @@ impl Cache {
         true
     }
 
-    /// Decides the TTL to cache a response for, or `None` if it must not be
-    /// cached.
-    fn cache_ttl_for(&self, msg: &Message) -> Option<Duration> {
+    /// Decides the TTL to cache a response for, in seconds, or `None` if it
+    /// must not be cached.
+    fn cache_ttl_for(&self, msg: &Message) -> Option<u32> {
         // Only successful and negative answers are worth caching.
         match msg.metadata.response_code {
             ResponseCode::NoError | ResponseCode::NXDomain => {}
@@ -454,7 +507,7 @@ impl Cache {
             return None;
         }
 
-        Some(Duration::from_secs(u64::from(ttl)))
+        Some(ttl)
     }
 
     /// Removes every entry.
@@ -487,7 +540,8 @@ impl Cache {
     #[cfg(test)]
     fn backdate(&self, k: &Key, by: Duration) {
         if let Some(e) = self.shard_of(k).lock().map.get_mut(k) {
-            e.stored = e.stored.checked_sub(by).unwrap_or(e.stored);
+            let by = u64::try_from(by.as_millis()).expect("a test's duration");
+            e.stored = e.stored.wrapping_sub(by);
         }
     }
 
@@ -535,19 +589,14 @@ fn secs_u32(d: Duration) -> u32 {
     u32::try_from(d.as_secs()).unwrap_or(u32::MAX)
 }
 
-/// A rough byte cost for a message.
-fn estimate_weight(msg: &Message) -> usize {
-    const PER_RECORD: usize = 64;
-    let records = msg.answers.len() + msg.authorities.len() + msg.additionals.len();
-    let names: usize = msg
-        .answers
-        .iter()
-        .chain(&msg.authorities)
-        .chain(&msg.additionals)
-        .map(|r| r.name.len())
-        .sum();
-
-    std::mem::size_of::<Entry>() + records * PER_RECORD + names
+/// What an entry occupies: its slot in the map, its slot in the eviction
+/// order, the packed response, and the key's name.
+///
+/// What the allocator rounds up to, and the empty buckets a hash table keeps,
+/// are not charged; they are the only part of the cache's footprint that this
+/// leaves out.
+fn charge(k: &Key, msg: &Packed) -> usize {
+    size_of::<(Key, Entry)>() + size_of::<(u64, Key)>() + msg.heap_len() + k.heap_len()
 }
 
 /// Reports whether a query type may be cached at all.
@@ -658,19 +707,19 @@ mod tests {
         // answer carries, so check the lifetime the cache would choose.
         let c = Cache::new(Config::default());
         let r = resp("example.com.", 300);
-        assert_eq!(c.cache_ttl_for(&r), Some(Duration::from_secs(300)));
+        assert_eq!(c.cache_ttl_for(&r), Some(300));
 
         c.set_config(Config {
             ttl_max: 5,
             ..Default::default()
         });
-        assert_eq!(c.cache_ttl_for(&r), Some(Duration::from_secs(5)));
+        assert_eq!(c.cache_ttl_for(&r), Some(5));
 
         c.set_config(Config {
             ttl_min: 600,
             ..Default::default()
         });
-        assert_eq!(c.cache_ttl_for(&r), Some(Duration::from_secs(600)));
+        assert_eq!(c.cache_ttl_for(&r), Some(600));
     }
 
     #[test]
@@ -714,7 +763,7 @@ mod tests {
         let a = Key::from_request(&req("Example.COM.")).unwrap();
         let b = Key::from_request(&req("example.com.")).unwrap();
         assert_eq!(a, b);
-        assert_eq!(a.name, "example.com");
+        assert_eq!(&*a.name, "example.com");
     }
 
     #[test]
@@ -749,19 +798,13 @@ mod tests {
             ttl_min: 60,
             ..Default::default()
         });
-        assert_eq!(
-            c.cache_ttl_for(&resp("a.com.", 5)),
-            Some(Duration::from_secs(60))
-        );
+        assert_eq!(c.cache_ttl_for(&resp("a.com.", 5)), Some(60));
 
         let c = Cache::new(Config {
             ttl_max: 30,
             ..Default::default()
         });
-        assert_eq!(
-            c.cache_ttl_for(&resp("a.com.", 300)),
-            Some(Duration::from_secs(30))
-        );
+        assert_eq!(c.cache_ttl_for(&resp("a.com.", 300)), Some(30));
     }
 
     #[test]
@@ -1009,6 +1052,66 @@ mod tests {
                 std::ptr::eq(c.shard_of(&other), target)
             })
             .expect("some name shares the shard")
+    }
+
+    #[test]
+    fn an_entry_stays_small() {
+        // The cache holds as many of these as `cache_size` fits.  Holding a
+        // hickory `Message` made an entry 208 bytes before its heap, which
+        // was another 360 for one address.
+        assert!(
+            size_of::<Entry>() <= 80,
+            "Entry grew to {} bytes",
+            size_of::<Entry>()
+        );
+        assert!(
+            size_of::<Key>() <= 40,
+            "Key grew to {} bytes, and every entry holds two",
+            size_of::<Key>()
+        );
+    }
+
+    #[test]
+    fn an_entry_is_charged_for_what_it_holds() {
+        // A one-address answer used to be charged 384 bytes while occupying
+        // 833, so the budget was overrun twice over before anything was
+        // evicted.  Measured with a counting allocator, the packed form
+        // occupies within a few bytes of its charge.
+        let c = Cache::new(Config::default());
+        let k = Key::from_request(&req("example.com.")).unwrap();
+        assert!(c.put(k.clone(), &resp("example.com.", 300)));
+
+        let slots = size_of::<(Key, Entry)>() + size_of::<(u64, Key)>();
+        assert!(c.bytes() > slots, "both slots and the heap are charged");
+        assert!(c.bytes() < 300, "charged {} bytes", c.bytes());
+    }
+
+    #[test]
+    fn a_hit_is_the_answer_that_was_stored() {
+        // Byte for byte, and so case for case: packing is lossless.
+        let c = Cache::new(Config::default());
+        let q = "www.example.com.";
+        let mut m = resp(q, 300);
+        m.answers = vec![
+            Record::from_rdata(
+                Name::from_utf8(q).unwrap(),
+                300,
+                RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                    Name::from_ascii("Edge.CDN.example.net.").unwrap(),
+                )),
+            ),
+            Record::from_rdata(
+                Name::from_ascii("Edge.CDN.example.net.").unwrap(),
+                300,
+                RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 1))),
+            ),
+        ];
+        let k = Key::from_request(&req(q)).unwrap();
+        assert!(c.put(k.clone(), &m));
+
+        let hit = c.get(&k).expect("a hit");
+        assert_eq!(hit.msg.to_vec().unwrap(), m.to_vec().unwrap());
+        assert_eq!(hit.msg.answers[1].name.to_ascii(), "Edge.CDN.example.net.");
     }
 
     #[test]

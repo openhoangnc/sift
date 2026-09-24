@@ -11,6 +11,7 @@ pub mod dns64;
 pub mod doq;
 pub mod edns;
 pub mod msg;
+mod packed;
 pub mod pending;
 pub mod pool;
 pub mod probe;
