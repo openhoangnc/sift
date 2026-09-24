@@ -21,9 +21,11 @@ failure.
 
 import argparse
 import base64
+import itertools
 import json
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -116,8 +118,35 @@ def query(port, name):
     return status, answers
 
 
+# Each rule set carries a sentinel of its own, so a server that has applied it
+# can be told from one still answering with the set before.
+SENTINELS = itertools.count()
+
+
+def apply_rules(base, auth, rules, timeout=10.0):
+    """Sets the user rules and waits until the server filters with them.
+
+    The Go build rebuilds its engine asynchronously after `set_rules`, so
+    asking straight away can be answered by the previous rule set -- every
+    case then shows the answer the one before it should have had.  A
+    sentinel rule unique to this call, for a name no case asks about, is
+    filtered only once this set is the one in use.
+    """
+    sentinel = f"sentinel-{next(SENTINELS)}.test"
+    api(base, "/control/filtering/set_rules", auth, {"rules": rules + [f"||{sentinel}^"]})
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        check = api(base, f"/control/filtering/check_host?name={sentinel}", auth)
+        if check.get("reason") == "FilteredBlackList":
+            return
+        time.sleep(0.05)
+
+    raise RuntimeError(f"{base} did not apply its rules within {timeout}s")
+
+
 def observe(base, port, auth, rules):
-    api(base, "/control/filtering/set_rules", auth, {"rules": rules})
+    apply_rules(base, auth, rules)
     check = api(base, f"/control/filtering/check_host?name={HOST}", auth)
     status, answers = query(port, HOST)
 
