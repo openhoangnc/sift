@@ -15,6 +15,7 @@ mod packed;
 pub mod pending;
 pub mod pool;
 pub mod probe;
+pub mod quic;
 pub mod ratelimit;
 pub mod refresh;
 pub mod resolver;

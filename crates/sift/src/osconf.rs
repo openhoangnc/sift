@@ -179,11 +179,122 @@ pub fn set_rlimit_nofile(_limit: u64) -> Result<(), Error> {
     Err(Error::Unsupported("os.rlimit_nofile"))
 }
 
+/// The descriptor limit the process runs under now -- the soft one -- or
+/// `None` when it is unlimited or cannot be known.
+#[cfg(unix)]
+pub fn nofile_limit() -> Option<u64> {
+    rustix::process::getrlimit(rustix::process::Resource::Nofile).current
+}
+
+/// The descriptor limit the process runs under now.
+#[cfg(not(unix))]
+pub fn nofile_limit() -> Option<u64> {
+    None
+}
+
+/// What Go's runtime raises the soft descriptor limit to when it starts, or
+/// `None` when it leaves it alone.
+///
+/// Go has done this since 1.19, in `syscall`'s `init`, before `main`, on
+/// every Unix.  In 1.26, which AdGuard Home v0.107.79 is built with:
+///
+/// ```go
+/// if err := Getrlimit(RLIMIT_NOFILE, &lim); err == nil && lim.Max > 0 && lim.Cur < lim.Max-1 {
+///     nlim := lim
+///     nlim.Cur = nlim.Max - 1
+///     adjustFileLimit(&nlim)          // darwin: at most kern.maxfilesperproc
+///     setrlimit(RLIMIT_NOFILE, &nlim)
+/// }
+/// ```
+///
+/// so the same unit file that leaves a process 1,024 descriptors gives the Go
+/// build the hard limit, half a million under systemd's defaults.  `max` is
+/// the hard limit with infinity as `u64::MAX`, which is Linux's
+/// `RLIM_INFINITY`: there Go asks for one less and the kernel refuses, so
+/// Go's limit stays where it was, and so does this one.  `cap` is darwin's
+/// per-process ceiling.
+///
+/// One deliberate difference: Go *lowers* a soft limit that is already above
+/// darwin's ceiling, and this never lowers anything.
+pub fn go_raised_nofile(current: u64, max: u64, cap: Option<u64>) -> Option<u64> {
+    if max == 0 || current >= max - 1 {
+        return None;
+    }
+
+    let target = cap.map_or(max - 1, |c| c.min(max - 1));
+
+    (target > current).then_some(target)
+}
+
+/// darwin's per-process descriptor ceiling, `kern.maxfilesperproc`.
+///
+/// Read with `sysctl(8)`: the system call itself is out of reach without
+/// `unsafe`, and this runs once, before anything else has started.
+#[cfg(target_os = "macos")]
+fn per_process_cap() -> Option<u64> {
+    let out = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "kern.maxfilesperproc"])
+        .output()
+        .ok()?;
+
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+}
+
+/// Every other Unix leaves the limit to the kernel.
+#[cfg(not(target_os = "macos"))]
+fn per_process_cap() -> Option<u64> {
+    None
+}
+
+/// Raises the soft descriptor limit the way Go's runtime does at start.
+///
+/// The Go build gets this whether or not `os.rlimit_nofile` is set, before
+/// anything reads its configuration; without it, a unit file or a container
+/// that worked for the Go build left this one with a thousand descriptors,
+/// which a scan of the DNS-over-TLS port uses up in seconds.
+#[cfg(unix)]
+fn raise_nofile_like_go() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    let lim = getrlimit(Resource::Nofile);
+    // An unlimited soft limit has nowhere to go.
+    let Some(current) = lim.current else {
+        return;
+    };
+    let Some(target) =
+        go_raised_nofile(current, lim.maximum.unwrap_or(u64::MAX), per_process_cap())
+    else {
+        return;
+    };
+
+    let raised = setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current: Some(target),
+            maximum: lim.maximum,
+        },
+    );
+    match raised {
+        Ok(()) => tracing::info!(from = current, to = target, "descriptor limit raised"),
+        // Go says nothing; the limit it was left with is worth a line, since
+        // the connection limits are sized from it.
+        Err(e) => tracing::warn!(limit = current, error = %e, "raising the descriptor limit"),
+    }
+}
+
+/// Nothing to raise off Unix.
+#[cfg(not(unix))]
+fn raise_nofile_like_go() {}
+
 /// Applies the `os` block of the configuration.
 ///
 /// A setting the platform cannot honour is a warning rather than a failure, as
 /// upstream treats it: the server is still usable, just not confined.
 pub fn apply(os: &sift_config::model::OsConfig) {
+    // First, as Go's runtime does it before AdGuard Home reads anything; an
+    // explicit `rlimit_nofile` then replaces it, as it does there.
+    raise_nofile_like_go();
+
     if os.rlimit_nofile != 0 {
         match set_rlimit_nofile(os.rlimit_nofile) {
             Ok(()) => tracing::info!(limit = os.rlimit_nofile, "descriptor limit set"),
@@ -251,6 +362,35 @@ adguardhome:x:1001:
         // A container image usually has no passwd entry for the id it runs as.
         assert_eq!(lookup_uid("65534"), Some(65534));
         assert_eq!(lookup_gid("0"), Some(0));
+    }
+
+    #[test]
+    fn the_descriptor_limit_is_raised_as_gos_runtime_raises_it() {
+        // A systemd unit's defaults: Go runs with one short of the hard limit.
+        assert_eq!(go_raised_nofile(1024, 524_288, None), Some(524_287));
+        // Docker's.
+        assert_eq!(go_raised_nofile(1024, 1_048_576, None), Some(1_048_575));
+        // darwin, whose hard limit is unlimited, stops at its ceiling.
+        assert_eq!(go_raised_nofile(256, u64::MAX, Some(61_440)), Some(61_440));
+        // Linux with an unlimited hard limit: Go asks for one less than
+        // infinity, and the kernel refuses it there as it will here.
+        assert_eq!(go_raised_nofile(1024, u64::MAX, None), Some(u64::MAX - 1));
+    }
+
+    #[test]
+    fn a_limit_already_where_go_would_put_it_is_left_alone() {
+        assert_eq!(go_raised_nofile(524_287, 524_288, None), None);
+        assert_eq!(go_raised_nofile(524_288, 524_288, None), None);
+        assert_eq!(go_raised_nofile(0, 0, None), None, "a hard limit of zero");
+        // Go would lower this to darwin's ceiling; nothing here lowers a limit.
+        assert_eq!(go_raised_nofile(1_048_576, u64::MAX, Some(61_440)), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_descriptor_limit_can_be_read() {
+        // Whatever the test runner was given, it is something.
+        assert!(nofile_limit().is_none_or(|n| n > 0));
     }
 
     #[test]

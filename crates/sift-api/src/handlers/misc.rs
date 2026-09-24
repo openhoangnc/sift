@@ -4,14 +4,14 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::auth;
+use crate::auth::{self, Verdict};
 use crate::error::{ApiError, ApiResult};
 use crate::state::Shared;
 
@@ -852,14 +852,25 @@ pub async fn change_language(State(s): State<Shared>, body: String) -> ApiResult
 }
 
 /// `GET /control/profile`
-pub async fn profile(State(s): State<Shared>, headers: HeaderMap) -> Json<serde_json::Value> {
+///
+/// The name is the one the gate signed the request in as.  Working it out
+/// again here meant a second bcrypt for every request carrying Basic
+/// credentials, run while this held the config lock and then took it a
+/// second time inside -- which a writer queued between the two would have
+/// turned into a deadlock.
+pub async fn profile(
+    State(s): State<Shared>,
+    user: Option<Extension<auth::SignedIn>>,
+) -> Json<serde_json::Value> {
     let cfg = s.config.read();
-    let name = current_user(&s, &headers).unwrap_or_else(|| {
-        cfg.users
-            .first()
-            .map(|u| u.name.clone())
-            .unwrap_or_default()
-    });
+    let name = user
+        .map(|Extension(auth::SignedIn(name))| name)
+        .unwrap_or_else(|| {
+            cfg.users
+                .first()
+                .map(|u| u.name.clone())
+                .unwrap_or_default()
+        });
 
     Json(json!({
         "name": name,
@@ -901,21 +912,29 @@ pub async fn profile_update(
     s.save_config().map_err(ApiError::internal)
 }
 
-/// Returns the name of the user the request is authenticated as.
-pub fn current_user(s: &Shared, headers: &HeaderMap) -> Option<String> {
-    if let Some(c) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
-        && let Some(tok) = auth::token_from_cookies(c)
-        && let Some(sess) = s.sessions.get(tok)
-    {
-        return Some(sess.user);
-    }
+/// Returns the name of the user whose session cookie the request carries.
+///
+/// Only the cookie: Basic credentials mean a password check, which is the
+/// gate's to make, under the throttle -- see `routes::authenticate`.
+pub fn session_user(s: &Shared, headers: &HeaderMap) -> Option<String> {
+    let c = headers.get(header::COOKIE)?.to_str().ok()?;
+    let tok = auth::token_from_cookies(c)?;
 
-    let a = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let (user, pass) = auth::basic_credentials(a)?;
-    let cfg = s.config.read();
-    let u = cfg.users.iter().find(|u| u.name == user)?;
+    s.sessions.get(tok).map(|sess| sess.user)
+}
 
-    auth::verify_password(&pass, &u.password).then_some(user)
+/// The stored hash of a user's password, if there is such a user.
+///
+/// A copy, so the check that follows runs without the config lock held: a
+/// bcrypt takes long enough that holding a read lock through it stalls every
+/// writer behind a stranger's guess.
+pub fn stored_hash(s: &Shared, name: &str) -> Option<String> {
+    s.config
+        .read()
+        .users
+        .iter()
+        .find(|u| u.name == name)
+        .map(|u| u.password.clone())
 }
 
 /// The `/control/login` request.
@@ -933,38 +952,36 @@ pub struct LoginReq {
 
 /// `POST /control/login`
 ///
-/// The throttle is consulted before the password is checked and updated after,
-/// which is the order upstream's `handleLogin` uses: a blocked client is
-/// turned away without its guess ever being compared, so a block costs the
-/// same whether the guess was right or wrong.
+/// The throttle is consulted before the password is checked, which is the
+/// order upstream's `handleLogin` uses: a blocked client is turned away
+/// without its guess ever being compared, so a block costs the same whether
+/// the guess was right or wrong.  Unlike upstream, an attempt from the
+/// internet is counted before the check rather than after, and handed back
+/// if it was right -- see [`auth::LoginLimiter::check`] -- so guesses sent
+/// all at once cannot all slip under the threshold together.  A source the
+/// connection guard spares is checked and counted as upstream does it; see
+/// [`auth::Lane`].
 pub async fn login(
     State(s): State<Shared>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<LoginReq>,
 ) -> Response {
     let client = peer.ip().to_string();
-    let left = s.login_limiter.blocked_for(&client);
-    if !left.is_zero() {
-        return auth::too_many_attempts(left);
+    let hash = stored_hash(&s, &req.name);
+    let lane = crate::routes::lane(&s, &client);
+    let key = crate::routes::throttle_key(&s, &client);
+
+    match s.login_limiter.check(&key, lane, req.password, hash).await {
+        Verdict::Accepted => {}
+        Verdict::Blocked(left) => return auth::too_many_attempts(left),
+        Verdict::Busy => return auth::verifiers_busy(),
+        Verdict::Rejected => {
+            // 403, not the 401 this once answered: upstream's `handleLogin`
+            // hands `newCookie`'s error to `writeErrorWithIP` with
+            // `StatusForbidden`.
+            return (StatusCode::FORBIDDEN, "invalid username or password").into_response();
+        }
     }
-
-    let ok = {
-        let cfg = s.config.read();
-        cfg.users
-            .iter()
-            .find(|u| u.name == req.name)
-            .is_some_and(|u| auth::verify_password(&req.password, &u.password))
-    };
-
-    if !ok {
-        s.login_limiter.record_failure(&client);
-
-        // 403, not the 401 this once answered: upstream's `handleLogin` hands
-        // `newCookie`'s error to `writeErrorWithIP` with `StatusForbidden`.
-        return (StatusCode::FORBIDDEN, "invalid username or password").into_response();
-    }
-
-    s.login_limiter.record_success(&client);
 
     let ttl = Duration::from_secs(s.config.read().http.session_ttl.as_secs().max(1) as u64);
     let token = s.sessions.create(&req.name, ttl);

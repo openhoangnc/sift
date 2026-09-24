@@ -1,9 +1,7 @@
 //! The control API's routing table and its authentication gate.
 
-use std::time::Duration;
-
-use axum::extract::{Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -11,10 +9,63 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::auth::{self, Verdict};
 use crate::doh;
 use crate::error::{ApiError, ApiResult};
 use crate::handlers::{filtering, logs, memory, misc, status};
 use crate::state::Shared;
+
+/// The most a request body may carry: upstream's `defaultReqBodySzLim`.
+///
+/// Every route, DNS-over-HTTPS included, and `/control/login` -- which anyone
+/// can reach -- among them.  The limit is enforced while the body is read, so
+/// a request that says it is sending more, or says nothing and keeps sending,
+/// is cut off at this many bytes rather than buffered first and measured
+/// after.  axum's own default was 2 MB.
+pub const DEFAULT_BODY_LIMIT: usize = 64 * 1024;
+
+/// The most a body may carry on the routes that take a whole list at once:
+/// upstream's `largerReqBodySzLim`.
+///
+/// Upstream calls these "poorly designed current APIs" and exempts exactly two
+/// of them; see [`body_limit`].  A user's own rules can run to megabytes, and
+/// under axum's 2 MB default this refused a `set_rules` the Go build takes.
+pub const LARGER_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
+/// The most a request's body may carry: upstream's `expectsLargerRequests`.
+///
+/// Public so a listener that reads a body before handing it to the router --
+/// the HTTP/3 one does -- applies the same rule as the router rather than a
+/// number of its own.
+pub fn body_limit(method: &Method, path: &str) -> usize {
+    let larger = method == Method::POST
+        && matches!(path, "/control/access/set" | "/control/filtering/set_rules");
+
+    if larger {
+        LARGER_BODY_LIMIT
+    } else {
+        DEFAULT_BODY_LIMIT
+    }
+}
+
+/// Bounds every request body by [`body_limit`]: upstream's `limitRequestBody`.
+///
+/// One middleware over the whole router, choosing by method and full path as
+/// upstream's does, rather than a layer per route, so the two exemptions are
+/// written in one place and the HTTP/3 listener can ask the same function.
+/// It sits outside the `/control` nest, where the path still carries its
+/// prefix.  The extractors -- `Json`, `Bytes`, `String` -- honour the limit it
+/// sets and answer 413 when a body runs past it.
+async fn limit_request_body(req: Request, next: Next) -> Response {
+    use tower::{Layer as _, ServiceExt as _};
+
+    let limit = body_limit(req.method(), req.uri().path());
+
+    match DefaultBodyLimit::max(limit).layer(next).oneshot(req).await {
+        Ok(r) => r,
+        Err(never) => match never {},
+    }
+}
 
 /// Paths reachable without a session, always.
 ///
@@ -72,7 +123,8 @@ pub fn router(state: Shared, secure: bool) -> Router {
         ));
     }
 
-    app.layer(axum::Extension(doh::Secure(secure)))
+    app.layer(middleware::from_fn(limit_request_body))
+        .layer(axum::Extension(doh::Secure(secure)))
         .with_state(state)
 }
 
@@ -169,9 +221,9 @@ async fn serve_ui(State(s): State<Shared>, headers: HeaderMap, req: Request) -> 
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
     }
 
-    let user = match authenticate(&s, &req) {
+    let user = match authenticate(&s, &headers, peer_ip(&req)).await {
         Ok(u) => u,
-        Err(left) => return crate::auth::too_many_attempts(left),
+        Err(refusal) => return refusal.into_response(),
     };
 
     if user.is_some() {
@@ -225,11 +277,28 @@ fn is_install_page(path: &str) -> bool {
     asset_name(path).starts_with("install.")
 }
 
+/// Why the gate turned a request away without looking at what it asked.
+enum Refusal {
+    /// The client has spent its attempts, and must wait this long.
+    Spent(std::time::Duration),
+    /// Every verifier stayed busy for as long as a check waits for one, or
+    /// the client is new and the throttle has no room to count it.
+    Busy,
+}
+
+impl IntoResponse for Refusal {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Spent(left) => auth::too_many_attempts(left),
+            Self::Busy => auth::verifiers_busy(),
+        }
+    }
+}
+
 /// Identifies the caller, throttling Basic-credential guessing as it goes.
 ///
-/// `Err` carries how long a client that has spent its attempts must wait;
-/// building the refusal is left to the caller, which keeps the response types
-/// out of a function whose answer is a user name.
+/// `Err` is the refusal to send instead of serving the request: a client that
+/// has spent its attempts, or a check that could not get a verifier.
 ///
 /// Upstream throttles its Basic path and not its cookie path, and so does
 /// this: a session token is sixteen random bytes, so guessing one is not a
@@ -237,26 +306,94 @@ fn is_install_page(path: &str) -> bool {
 /// no `Authorization` header at all therefore costs a client nothing, which
 /// is how a signed-out browser can keep asking for `/` without locking the
 /// address out.
-fn authenticate(s: &Shared, req: &Request) -> Result<Option<String>, Duration> {
-    let headers = req.headers();
-    if !headers.contains_key(header::AUTHORIZATION) {
-        return Ok(misc::current_user(s, headers));
-    }
+///
+/// A password is checked the way `/control/login` checks one -- see
+/// [`auth::LoginLimiter::check`] -- because every endpoint that accepts Basic
+/// credentials is a place to guess one.  `client` is [`peer_ip`]'s answer;
+/// the request itself is not borrowed across the check, since a body is not
+/// `Sync` and a future holding one by reference could not move between
+/// threads.
+async fn authenticate(
+    s: &Shared,
+    headers: &HeaderMap,
+    client: String,
+) -> Result<Option<String>, Refusal> {
+    let Some(authorization) = headers.get(header::AUTHORIZATION) else {
+        return Ok(misc::session_user(s, headers));
+    };
 
-    let client = peer_ip(req);
-    let left = s.login_limiter.blocked_for(&client);
+    let key = throttle_key(s, &client);
+    let left = s.login_limiter.blocked_for(&key);
     if !left.is_zero() {
-        return Err(left);
+        return Err(Refusal::Spent(left));
     }
 
-    let user = misc::current_user(s, headers);
-    if user.is_some() {
-        s.login_limiter.record_success(&client);
-    } else {
-        s.login_limiter.record_failure(&client);
+    if let Some(user) = misc::session_user(s, headers) {
+        s.login_limiter.record_success(&key);
+
+        return Ok(Some(user));
     }
 
-    Ok(user)
+    let Some((name, password)) = authorization
+        .to_str()
+        .ok()
+        .and_then(auth::basic_credentials)
+    else {
+        // Something that is not a name and a password is still an attempt,
+        // as it always was here -- and counted the way every other one is,
+        // so a newcomer the throttle has no room for is refused rather than
+        // answered uncounted.
+        return match s.login_limiter.begin(&key, lane(s, &client)) {
+            Ok(()) => Ok(None),
+            Err(Verdict::Blocked(left)) => Err(Refusal::Spent(left)),
+            Err(_) => Err(Refusal::Busy),
+        };
+    };
+
+    let verdict = s
+        .login_limiter
+        .check(
+            &key,
+            lane(s, &client),
+            password,
+            misc::stored_hash(s, &name),
+        )
+        .await;
+    match verdict {
+        Verdict::Accepted => Ok(Some(name)),
+        Verdict::Rejected => Ok(None),
+        Verdict::Blocked(left) => Err(Refusal::Spent(left)),
+        Verdict::Busy => Err(Refusal::Busy),
+    }
+}
+
+/// Which queue a password check from `client` waits in, as
+/// [`auth::Lane`] explains.
+///
+/// A source the connection guard spares is spared the queue too -- the one
+/// notion of "local" the whole server uses, so a device the guard would
+/// never refuse is never told the verifiers are busy.  `client` is
+/// [`peer_ip`]'s answer; anything that is not an address waits its turn.
+pub(crate) fn lane(s: &Shared, client: &str) -> auth::Lane {
+    match client.parse::<std::net::IpAddr>() {
+        Ok(ip) if s.dns_server.probes.exempts(ip) => auth::Lane::Local,
+        _ => auth::Lane::Shared,
+    }
+}
+
+/// The source the throttle counts `client`'s attempts against.
+///
+/// The connection guard's own key, so the two defences agree on what one
+/// source is: an IPv4 address, an IPv6 /64 -- and one address at a time in
+/// this host's own /64, where a household reaching the server over global
+/// IPv6 would otherwise share one budget, and one device's wrong passwords
+/// lock out every other.  `client` is [`peer_ip`]'s answer; anything that is
+/// not an address is kept as it is.
+pub(crate) fn throttle_key(s: &Shared, client: &str) -> String {
+    match client.parse::<std::net::IpAddr>() {
+        Ok(ip) => s.dns_server.probes.source(ip).to_string(),
+        Err(_) => client.to_string(),
+    }
 }
 
 /// The address a request arrived from, which the throttle keys on.
@@ -267,7 +404,8 @@ fn authenticate(s: &Shared, req: &Request) -> Result<Option<String>, Duration> {
 /// See <https://github.com/AdguardTeam/AdGuardHome/issues/2799>.
 ///
 /// The port is dropped, or every fresh connection would be a fresh client and
-/// the throttle would hold nobody back.
+/// the throttle would hold nobody back.  The throttle widens an IPv6 address
+/// to its /64 itself, for the same reason.
 pub fn peer_ip(req: &Request) -> String {
     req.extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -278,7 +416,7 @@ pub fn peer_ip(req: &Request) -> String {
 /// Rejects requests that carry no valid session, once a user exists.
 ///
 /// `path` is the path within the `/control` router: see [`PUBLIC`].
-async fn require_auth(State(s): State<Shared>, req: Request, next: Next) -> Response {
+async fn require_auth(State(s): State<Shared>, mut req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let first_run = s.needs_install();
 
@@ -294,10 +432,15 @@ async fn require_auth(State(s): State<Shared>, req: Request, next: Next) -> Resp
         return next.run(req).await;
     }
 
-    match authenticate(&s, &req) {
-        Ok(Some(_)) => return next.run(req).await,
+    let client = peer_ip(&req);
+    match authenticate(&s, req.headers(), client).await {
+        Ok(Some(user)) => {
+            req.extensions_mut().insert(auth::SignedIn(user));
+
+            return next.run(req).await;
+        }
         Ok(None) => {}
-        Err(left) => return crate::auth::too_many_attempts(left),
+        Err(refusal) => return refusal.into_response(),
     }
 
     // A bare 401, as upstream writes.  Adding `WWW-Authenticate: Basic` here
@@ -687,6 +830,170 @@ pub async fn enabled_json(enabled: bool) -> Json<serde_json::Value> {
     Json(json!({ "enabled": enabled }))
 }
 
+/// A whole server state, for tests that drive the assembled router.
+///
+/// The integration tests under `tests/` build their own; this one is for the
+/// unit tests that need to reach inside -- the throttle's count, the
+/// verifiers, the response extensions a listener reads -- which only code in
+/// the crate can.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::response::Response;
+
+    use crate::auth::LoginLimiter;
+    use crate::state::{AppState, NoFetcher, NoReloader, Shared};
+
+    /// A user whose password is hashed at `cost`.
+    ///
+    /// Upstream's cost is 10; a test that only needs a user to exist uses the
+    /// cheapest, and one that needs a check to take a while uses more.
+    pub(crate) fn user(name: &str, password: &str, cost: u32) -> sift_config::model::WebUser {
+        sift_config::model::WebUser {
+            name: name.to_string(),
+            password: bcrypt::hash(password, cost).expect("hashing"),
+        }
+    }
+
+    /// A state with these users, whose engine blocks `ads.example.com`, and
+    /// whose throttle is the configuration's, adjusted by `limiter`.
+    pub(crate) fn state(
+        users: Vec<sift_config::model::WebUser>,
+        limiter: impl FnOnce(LoginLimiter) -> LoginLimiter,
+    ) -> Shared {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+        let mut config = sift_config::Config::default();
+        config.dns.upstream_dns = vec![];
+        config.dns.bootstrap_dns = vec![];
+        config.filters = vec![];
+        config.users = users;
+
+        let resolver = Arc::new(sift_dns::resolver::Resolver::new(
+            sift_filter::engine::Engine::build(
+                [(1i64, "||ads.example.com^")],
+                sift_filter::engine::NO_LISTS,
+            ),
+            sift_dns::rewrite::Table::default(),
+            sift_dns::cache::Cache::new(sift_dns::cache::Config::default()),
+            sift_dns::pool::SharedPool::new(sift_dns::pool::Pool::new(
+                vec![],
+                vec![],
+                vec![],
+                sift_dns::pool::Mode::LoadBalance,
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+            )),
+            sift_dns::resolver::Settings::default(),
+        ));
+
+        let dns_server = Arc::new(sift_dns::server::Server::new(
+            resolver.clone(),
+            Arc::new(sift_dns::ratelimit::Limiter::new(
+                sift_dns::ratelimit::Config {
+                    per_second: 0,
+                    ..Default::default()
+                },
+            )),
+            Arc::new(sift_dns::server::NoopObserver),
+        ));
+
+        let base = std::env::temp_dir().join(format!(
+            "sift-api-unit-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let paths = sift_config::Paths::new(base.join("work"), base.join("conf/AdGuardHome.yaml"));
+        paths.ensure().expect("preparing the working directory");
+
+        let login_limiter = limiter(LoginLimiter::from_config(&config));
+
+        Arc::new(AppState {
+            paths: paths.clone(),
+            config: parking_lot::RwLock::new(config),
+            resolver,
+            dns_server,
+            filters: parking_lot::RwLock::new(sift_filter::lists::Manager::default()),
+            querylog: Arc::new(sift_querylog::log::QueryLog::new(
+                paths.query_log(""),
+                paths.query_log_rotated(""),
+                sift_querylog::log::Config {
+                    file_enabled: false,
+                    ..Default::default()
+                },
+            )),
+            stats: Arc::new(sift_stats::stats::Stats::new(
+                sift_stats::stats::Config::default(),
+            )),
+            sessions: crate::auth::Sessions::new(),
+            login_limiter,
+            started: jiff::Timestamp::now(),
+            fetcher: Arc::new(NoFetcher),
+            reloader: Arc::new(NoReloader),
+            dns_addresses: parking_lot::RwLock::new(vec![]),
+            version: Arc::new(crate::state::NoVersionCheck),
+            updater: Arc::new(crate::state::NoSelfUpdate),
+            version_cache: parking_lot::RwLock::new(None),
+        })
+    }
+
+    /// Sends one request through the assembled router, as if from `peer`.
+    pub(crate) async fn send(
+        s: &Shared,
+        secure: bool,
+        peer: &str,
+        req: axum::http::request::Builder,
+        body: Body,
+    ) -> Response {
+        use tower::ServiceExt as _;
+
+        let peer: SocketAddr = peer.parse().expect("a socket address");
+        let req: Request<Body> = req
+            .extension(axum::extract::ConnectInfo(peer))
+            .body(body)
+            .expect("a request");
+
+        super::router(s.clone(), secure)
+            .oneshot(req)
+            .await
+            .expect("the router is infallible")
+    }
+
+    /// A body that never ends, and counts what has been taken from it.
+    ///
+    /// What a client that says nothing about its length and keeps sending
+    /// looks like to a handler, so a test can tell a limit enforced while
+    /// reading from one checked after.
+    pub(crate) struct Endless {
+        pub(crate) taken: Arc<AtomicUsize>,
+    }
+
+    /// Each frame an `Endless` body yields.
+    pub(crate) const CHUNK: usize = 16 * 1024;
+
+    impl hyper::body::Body for Endless {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            self.taken.fetch_add(CHUNK, Ordering::Relaxed);
+
+            std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                bytes::Bytes::from_static(&[b' '; CHUNK]),
+            ))))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -928,6 +1235,477 @@ mod tests {
                 line.contains("hashprefix_unsupported"),
                 "{route} must refuse, but routes to: {line}"
             );
+        }
+    }
+
+    mod body_limits {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+
+        use super::super::testing::{self, CHUNK, Endless};
+        use super::super::{DEFAULT_BODY_LIMIT, LARGER_BODY_LIMIT, body_limit};
+        use crate::state::Shared;
+
+        /// A signed-in state and the cookie that proves it.
+        fn signed_in() -> (Shared, String) {
+            let s = testing::state(vec![testing::user("admin", "pw", 4)], |l| l);
+            let token = s
+                .sessions
+                .create("admin", std::time::Duration::from_secs(600));
+
+            (s, format!("agh_session={token}"))
+        }
+
+        fn post(path: &str, cookie: &str) -> axum::http::request::Builder {
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("cookie", cookie)
+        }
+
+        /// A JSON body of exactly `len` bytes: a list of rules, padded.
+        fn rules_body(len: usize) -> String {
+            let head = r#"{"rules":["||example.org^"#;
+            let tail = r#""]}"#;
+
+            format!("{head}{}{tail}", "x".repeat(len - head.len() - tail.len()))
+        }
+
+        #[test]
+        fn exactly_upstreams_two_routes_take_the_larger_limit() {
+            // Upstream's `expectsLargerRequests`: POST, and these two paths.
+            for path in ["/control/access/set", "/control/filtering/set_rules"] {
+                assert_eq!(body_limit(&Method::POST, path), LARGER_BODY_LIMIT, "{path}");
+                assert_eq!(
+                    body_limit(&Method::GET, path),
+                    DEFAULT_BODY_LIMIT,
+                    "{path}, and only when posted to"
+                );
+            }
+
+            for path in [
+                "/control/login",
+                "/control/filtering/add_url",
+                "/control/clients/add",
+                "/dns-query",
+                // The path inside the nest is not the path upstream compares.
+                "/filtering/set_rules",
+            ] {
+                assert_eq!(
+                    body_limit(&Method::POST, path),
+                    DEFAULT_BODY_LIMIT,
+                    "{path}"
+                );
+            }
+
+            assert_eq!(DEFAULT_BODY_LIMIT, 65_536, "upstream's 64 * datasize.KB");
+            assert_eq!(LARGER_BODY_LIMIT, 4_194_304, "upstream's 4 * datasize.MB");
+        }
+
+        #[tokio::test]
+        async fn a_body_over_64_kib_is_refused_on_an_ordinary_route() {
+            let (s, cookie) = signed_in();
+
+            let r = testing::send(
+                &s,
+                false,
+                "192.0.2.1:5000",
+                post("/control/dns_config", &cookie),
+                Body::from(format!(r#"{{"x":"{}"}}"#, "x".repeat(65 * 1024))),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+            // Including the one route anybody can reach.  axum's own default
+            // let a stranger make the login form buffer 2 MB.
+            let r = testing::send(
+                &s,
+                false,
+                "192.0.2.1:5000",
+                post("/control/login", ""),
+                Body::from(format!(r#"{{"name":"{}"}}"#, "x".repeat(65 * 1024))),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        #[tokio::test]
+        async fn user_rules_between_2_and_4_mib_are_accepted_as_go_accepts_them() {
+            // The drop-in half: under axum's 2 MB default this answered 413 to
+            // a set of rules the Go build takes.
+            let (s, cookie) = signed_in();
+
+            let body = rules_body(3 * 1024 * 1024);
+            let r = testing::send(
+                &s,
+                false,
+                "192.0.2.1:5000",
+                post("/control/filtering/set_rules", &cookie),
+                Body::from(body),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::OK);
+            assert_eq!(
+                s.filters.read().user_rules.len(),
+                1,
+                "the rules were stored"
+            );
+
+            // And past upstream's 4 MB it is refused, as it is there.
+            let r = testing::send(
+                &s,
+                false,
+                "192.0.2.1:5000",
+                post("/control/filtering/set_rules", &cookie),
+                Body::from(rules_body(LARGER_BODY_LIMIT + 1)),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        #[tokio::test]
+        async fn an_access_list_between_2_and_4_mib_is_accepted_too() {
+            let (s, cookie) = signed_in();
+
+            // About 220,000 entries, which is what a list that size is.
+            let entries: Vec<String> = (0..220_000u32)
+                .map(|i| std::net::Ipv4Addr::from(0x0a00_0000 + i).to_string())
+                .collect();
+            let body = serde_json::json!({ "disallowed_clients": entries }).to_string();
+            assert!(body.len() > 2 * 1024 * 1024 && body.len() < LARGER_BODY_LIMIT);
+
+            let r = testing::send(
+                &s,
+                false,
+                "192.0.2.1:5000",
+                post("/control/access/set", &cookie),
+                Body::from(body),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::OK);
+            assert_eq!(s.config.read().dns.disallowed_clients.len(), 220_000);
+        }
+
+        #[tokio::test]
+        async fn a_body_that_never_ends_is_cut_off_while_it_is_read() {
+            // A body that declares no length and keeps coming is the case a
+            // check made after buffering cannot catch: it is refused once it
+            // runs past the limit, having cost at most one frame beyond it.
+            let (s, cookie) = signed_in();
+            let taken = Arc::new(AtomicUsize::new(0));
+
+            let r = testing::send(
+                &s,
+                false,
+                "192.0.2.1:5000",
+                post("/control/dns_config", &cookie),
+                Body::new(Endless {
+                    taken: taken.clone(),
+                }),
+            )
+            .await;
+
+            assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let taken = taken.load(Ordering::Relaxed);
+            assert!(
+                taken <= DEFAULT_BODY_LIMIT + CHUNK,
+                "read {taken} bytes of an endless body"
+            );
+        }
+    }
+
+    mod sign_in {
+        use std::time::Duration;
+
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode, header};
+
+        use super::super::testing;
+        use crate::state::Shared;
+
+        const WRONG: &str = r#"{"name":"admin","password":"wrong"}"#;
+        const RIGHT: &str = r#"{"name":"admin","password":"pw"}"#;
+
+        async fn login(s: &Shared, peer: &str, body: &'static str) -> StatusCode {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/control/login")
+                .header("content-type", "application/json");
+
+            testing::send(s, false, peer, req, Body::from(body))
+                .await
+                .status()
+        }
+
+        #[tokio::test]
+        async fn addresses_in_one_slash_64_share_a_login_budget() {
+            // A subscriber is handed a /64 and can send from any address in
+            // it; keyed by address, each of those came with five fresh
+            // guesses.
+            let s = testing::state(vec![testing::user("admin", "pw", 4)], |l| l);
+
+            for n in 1..=5 {
+                let peer = format!("[2001:db8:1:2::{n:x}]:5000");
+                assert_eq!(
+                    login(&s, &peer, WRONG).await,
+                    StatusCode::FORBIDDEN,
+                    "attempt {n} is examined"
+                );
+            }
+
+            assert_eq!(
+                login(&s, "[2001:db8:1:2:ffff::1]:5000", RIGHT).await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "a fresh address in the same /64 has nothing left to spend"
+            );
+            assert_eq!(
+                login(&s, "[2001:db8:1:3::1]:5000", RIGHT).await,
+                StatusCode::OK,
+                "the next /64 is somebody else"
+            );
+
+            // An IPv4 client is still judged by its own address, whichever
+            // way the socket reports it.
+            for _ in 0..5 {
+                login(&s, "[::ffff:192.0.2.7]:5000", WRONG).await;
+            }
+            assert_eq!(
+                login(&s, "192.0.2.7:5000", RIGHT).await,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+            assert_eq!(login(&s, "192.0.2.8:5000", RIGHT).await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn each_device_in_this_hosts_own_slash_64_has_its_own_login_budget() {
+            // A household reaching the server at its global IPv6 address is
+            // in the server's own /64.  The connection guard judges each
+            // address there on its own, and the throttle keys the same way:
+            // one device's wrong passwords must not lock every other out.
+            let s = testing::state(vec![testing::user("admin", "pw", 4)], |l| l);
+            s.dns_server.probes.set_config(sift_dns::probe::Config {
+                host_networks: vec![("2001:db8:1:2::".parse().unwrap(), 64)],
+                ..Default::default()
+            });
+
+            for _ in 0..5 {
+                login(&s, "[2001:db8:1:2::a]:5000", WRONG).await;
+            }
+            assert_eq!(
+                login(&s, "[2001:db8:1:2::a]:5000", RIGHT).await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "the device that guessed has spent its attempts"
+            );
+            assert_eq!(
+                login(&s, "[2001:db8:1:2::b]:5000", RIGHT).await,
+                StatusCode::OK,
+                "and its neighbour has not"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn wrong_passwords_sent_at_once_cannot_exceed_the_limit() {
+            // Counted after the check, as upstream counts, every one of these
+            // passed the threshold before any of them had failed, and all
+            // twenty were examined.
+            let s = testing::state(vec![testing::user("admin", "pw", 6)], |l| l);
+
+            let tasks: Vec<_> = (0..20)
+                .map(|_| {
+                    let s = s.clone();
+                    tokio::spawn(async move { login(&s, "192.0.2.1:5000", WRONG).await })
+                })
+                .collect();
+
+            let mut examined = 0;
+            let mut turned_away = 0;
+            for t in tasks {
+                match t.await.unwrap() {
+                    StatusCode::FORBIDDEN => examined += 1,
+                    StatusCode::TOO_MANY_REQUESTS => turned_away += 1,
+                    other => panic!("unexpected {other}"),
+                }
+            }
+
+            assert_eq!(examined, 5, "no more guesses checked than the limit");
+            assert_eq!(turned_away, 15);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_script_sending_signed_requests_at_once_is_not_turned_away() {
+            // A dashboard polling the API with Basic credentials sends a
+            // handful of requests together, each one a password check.  They
+            // queue for the two verifiers rather than being refused, and they
+            // are counted only once they have one, so a burst of right
+            // answers never adds up to a block.
+            let s = testing::state(vec![testing::user("admin", "pw", 6)], |l| l);
+            let basic = "Basic YWRtaW46cHc="; // admin:pw
+
+            let tasks: Vec<_> = (0..12)
+                .map(|_| {
+                    let s = s.clone();
+                    tokio::spawn(async move {
+                        let req = Request::builder()
+                            .uri("/control/status")
+                            .header(header::AUTHORIZATION, basic);
+
+                        testing::send(&s, false, "192.0.2.1:5000", req, Body::empty())
+                            .await
+                            .status()
+                    })
+                })
+                .collect();
+
+            for t in tasks {
+                assert_eq!(t.await.unwrap(), StatusCode::OK);
+            }
+            assert_eq!(s.login_limiter.failures("192.0.2.1"), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn checking_a_password_does_not_hold_the_config_lock() {
+            // The check ran under `config.read()`, so for the length of every
+            // stranger's guess a settings change -- or protection coming back
+            // from a pause -- waited behind it.  A deliberately slow hash
+            // gives the check time to be caught in the act.
+            let s = testing::state(vec![testing::user("admin", "pw", 12)], |l| l);
+
+            let signing_in = {
+                let s = s.clone();
+                tokio::spawn(async move { login(&s, "192.0.2.1:5000", RIGHT).await })
+            };
+
+            // The attempt is counted the moment the check starts, and handed
+            // back when it ends.
+            let started = std::time::Instant::now();
+            while s.login_limiter.failures("192.0.2.1") == 0 {
+                assert!(started.elapsed() < Duration::from_secs(10), "never started");
+                tokio::task::yield_now().await;
+            }
+
+            let writer = s.config.try_write_for(Duration::from_millis(100));
+            assert!(
+                writer.is_some(),
+                "a writer got in while the password was being checked"
+            );
+            let still_checking = s.login_limiter.failures("192.0.2.1") == 1;
+            drop(writer);
+            assert!(still_checking, "and the check was still running then");
+
+            assert_eq!(signing_in.await.unwrap(), StatusCode::OK);
+            assert_eq!(s.login_limiter.failures("192.0.2.1"), 0, "handed back");
+        }
+
+        #[tokio::test]
+        async fn a_sign_in_that_finds_every_verifier_busy_is_told_to_come_back() {
+            // The same 429 and header a spent client gets, since it asks the
+            // same of the client; the login page shows the text.
+            let s = testing::state(vec![testing::user("admin", "pw", 4)], |l| l.impatient());
+            let held = s
+                .login_limiter
+                .verifiers()
+                .acquire_many_owned(2)
+                .await
+                .unwrap();
+
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/control/login")
+                .header("content-type", "application/json");
+            let r = testing::send(&s, false, "192.0.2.1:5000", req, Body::from(RIGHT)).await;
+
+            assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                r.headers()
+                    .get(header::RETRY_AFTER)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "1"
+            );
+            assert_eq!(
+                s.login_limiter.failures("192.0.2.1"),
+                0,
+                "a check that never ran is not held against anyone"
+            );
+
+            drop(held);
+            assert_eq!(login(&s, "192.0.2.1:5000", RIGHT).await, StatusCode::OK);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_script_on_this_network_is_served_while_the_verifiers_are_held() {
+            // Home Assistant polling with Basic credentials: whatever the
+            // internet is doing to the verifiers, a device the connection
+            // guard spares is checked at once, as upstream checks everyone.
+            let s = testing::state(vec![testing::user("admin", "pw", 4)], |l| l.impatient());
+            let held = s
+                .login_limiter
+                .verifiers()
+                .acquire_many_owned(2)
+                .await
+                .unwrap();
+            let basic = "Basic YWRtaW46cHc="; // admin:pw
+
+            let status = |peer: &'static str| {
+                let s = s.clone();
+                async move {
+                    let req = Request::builder()
+                        .uri("/control/status")
+                        .header(header::AUTHORIZATION, basic);
+
+                    testing::send(&s, false, peer, req, Body::empty())
+                        .await
+                        .status()
+                }
+            };
+
+            for peer in ["192.168.1.5:5000", "[fd00::5]:5000", "127.0.0.1:5000"] {
+                for _ in 0..5 {
+                    assert_eq!(status(peer).await, StatusCode::OK, "{peer}");
+                }
+            }
+            assert_eq!(login(&s, "10.0.0.2:5000", RIGHT).await, StatusCode::OK);
+
+            // The same request from the internet waits its turn, and is
+            // told to come back.
+            assert_eq!(
+                status("192.0.2.1:5000").await,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn the_profile_names_the_user_the_gate_signed_in() {
+            // Read from what the gate found rather than by checking the
+            // credentials again, which for Basic was a second bcrypt per
+            // request.  The second user is named so the first-user fallback
+            // cannot pass this by accident.
+            let s = testing::state(
+                vec![
+                    testing::user("admin", "pw", 4),
+                    testing::user("other", "pw2", 4),
+                ],
+                |l| l,
+            );
+
+            let req = Request::builder()
+                .uri("/control/profile")
+                .header(header::AUTHORIZATION, "Basic b3RoZXI6cHcy"); // other:pw2
+            let r = testing::send(&s, false, "192.0.2.1:5000", req, Body::empty()).await;
+            assert_eq!(r.status(), StatusCode::OK);
+
+            let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v["name"], "other");
         }
     }
 

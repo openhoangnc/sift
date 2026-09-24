@@ -126,9 +126,11 @@ pub struct Clients {
     pub persistent: usize,
     /// Addresses discovery has recorded something about.
     ///
-    /// Nothing evicts from this: an address is kept for the life of the
-    /// process, so on a resolver reachable from the internet it counts the
-    /// distinct sources that have ever asked it anything.
+    /// What the network taught -- reverse names and WHOIS records -- is held
+    /// to `sift_dns::clients::MAX_RUNTIME` entries, least useful first, while
+    /// what the hosts file and the ARP table supplied is never given up.  A
+    /// count sitting at the ceiling on a resolver reachable from the internet
+    /// is the bound working, not a leak.
     pub runtime: usize,
     /// How many of those carry a WHOIS record, which is the expensive half.
     pub runtime_whois: usize,
@@ -143,6 +145,14 @@ pub struct Server {
     pub ratelimit_buckets: usize,
     /// Addresses the connection probe is holding a mark for.
     pub probe_marks: usize,
+    /// What the connection guard holds and has done: the sources it is
+    /// judging and refusing, the connections and handshakes open against its
+    /// limits, and what it has turned away since start.
+    ///
+    /// `probe_marks` again as `tracked`, kept beside it rather than instead
+    /// of it, because `scripts/memwatch.py` and whatever else reads this
+    /// already look for the old name.
+    pub probes: sift_dns::probe::Stats,
     /// Live web sessions.
     pub sessions: usize,
 }
@@ -201,6 +211,7 @@ pub async fn memory(State(s): State<Shared>) -> Json<MemoryResp> {
             inflight: s.resolver.inflight(),
             ratelimit_buckets: s.dns_server.limiter.tracked(),
             probe_marks: s.dns_server.probes.tracked(),
+            probes: s.dns_server.probes.stats(),
             sessions: s.sessions.len(),
         },
     })

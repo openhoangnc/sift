@@ -43,3 +43,6 @@ x509-parser = "0.18.1"
 hyper = { version = "1.11.1", features = ["server"] }
 rcgen = "0.14.10"
 rustls-pemfile = "2.2.0"
+# `test-util` lets the tests of the stream deadlines run on a paused clock,
+# so a five-second timeout is proved in no time rather than slept through.
+tokio = { version = "1.53.1", features = ["test-util"] }

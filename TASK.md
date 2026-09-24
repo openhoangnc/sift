@@ -5,7 +5,7 @@ Work status for Sift, against AdGuard Home **v0.107.79**.
 Legend: **[x]** done and verified · **[~]** partial, see the note · **[ ]** not started
 
 Verification claims below are reproducible with `scripts/verify.sh` and
-`cargo test --workspace` (740 tests).
+`cargo test --workspace` (1,064 tests).
 
 ---
 
@@ -175,6 +175,19 @@ Verification claims below are reproducible with `scripts/verify.sh` and
       and is retried a minute later; a certificate inside a week of expiry
       with nothing renewing it is reported hourly, and an expired one as an
       error
+- [x] **`tls.strict_sni_check`**: parsed and ignored until v0.12.0. It now
+      refuses a DoT or DoQ handshake whose server name the certificate does
+      not cover, and answers `SERVFAIL` per query to a name that is neither
+      `tls.server_name` nor one label below it, as upstream's
+      `replaceGetCertificate` and `clientIDFromClientServerName` do. See
+      *Hardening the ports the internet can reach*
+- [x] **Session resumption** through a stateless ticketer on all four
+      configurations, so a scan of handshakes cannot push a real client out of
+      a 256-entry session cache
+- [x] **Hardened for the internet**: connection, handshake and in-flight
+      limits, deadlines on every stream, escalating refusal of scanners, and
+      an exploit-probe tripwire on the HTTPS port — see *Hardening the ports
+      the internet can reach*
 - [x] **Verified**: AdGuard's own dnsproxy client, with full certificate
       verification, resolves through all three listeners; the query log records
       them as `dot`, `doh` and `doq`; `/control/tls/status` matches Go field for
@@ -1343,18 +1356,42 @@ bounded, and the snapshot reports each one against its bound:
 | `stats.past_hours` | `statistics.interval` | pruning has stopped |
 | `querylog.recent` | `RECENT_CAP`, 5,000 | the ring is not dropping |
 | `server.ratelimit_buckets` | swept at 16,384, dropping five-minute-idle | sources active in one window, not a leak |
-| `server.probe_marks` | swept at 16,384, keeping the live ones | the same |
-| `clients.runtime` | **nothing** | see below |
+| `server.probe_marks` | `probe::MAX_TRACKED`, 65,536, strikes given up before penalties | the same |
+| `server.probes.open` | `max_connections`: 4096, or half the descriptor limit | a ticket is not being given back |
+| `clients.runtime` | `MAX_RUNTIME`, 10,000 learned, plus what the hosts file and ARP table supplied | eviction has stopped, or the hosts file / ARP table grew |
 
-`clients.runtime` is the one with no bound: an address is recorded the first
-time it asks something and kept for the life of the process, with a reverse
-name and, where WHOIS is on, an organisation, a city and a country. That is
-upstream's behaviour and it is bounded by the network on a home installation —
-19 addresses on the deployment above — but on a resolver reachable from the
-internet it counts every distinct source that has ever reached it. The
-snapshot reports it and how many of those carry a WHOIS record, which is the
-expensive half. Nothing has been changed about it: a bound would be a
-behaviour change, and the number should be looked at before it is chosen.
+`clients.runtime` is bounded at `sift_dns::clients::MAX_RUNTIME`: 10,000
+addresses learned from the network by reverse lookup or WHOIS. That is a
+deliberate deviation, since upstream's `runtimeIndex`
+(`internal/client/runtimeindex.go:8`) keeps every address it ever named for the
+life of the process. 10,000 is 500 times the 19 addresses on the deployment
+above, so a home installation never reaches it; at the cap the table measures
+about 4.6 MB.
+
+- **What is never given up:** names from the hosts file or the ARP table, and
+  any hardware address. None of them count against the cap, because a
+  persistent client identified by MAC depends on that entry.
+- **What goes when the table is full:** a tenth of it at once, least recently
+  seen first within each group, in this order:
+  1. public addresses seen once;
+  2. public addresses that came back at least ten minutes after first being
+     seen and have asked within a day;
+  3. local addresses seen once;
+  4. local addresses that came back.
+- **What the query path pays:** it only moves an atomic last-seen time under
+  the read lock.
+- **How discovery is rationed:**
+  - two queues of 256, local addresses first;
+  - one place per key, where a key is an IPv4 address, a local IPv6 address or
+    a public /64;
+  - a key whose lookup found nothing is left alone for an hour, as upstream's
+    caches do;
+  - sixteen lookups per public /64 an hour;
+  - at most 10,000 keys remembered.
+
+  Before this, an address with no reverse name was re-queued by every query it
+  sent. A count sitting at 10,000 on an exposed resolver is the bound working,
+  not a leak. See *Hardening the ports the internet can reach*.
 
 ### What the high-water mark turned out to say
 
@@ -2420,6 +2457,51 @@ Not bugs; recorded so nobody "fixes" them.
 
 ---
 
+- **The ports the internet can reach are defended, and upstream defends none
+  of them this way.** Each of these is ours, not upstream's:
+  - scanners are refused before the handshake, escalating for repeat
+    offenders;
+  - an HTTPS request for an exploit path bans its source;
+  - one source may hold 64 connections and 32 questions in flight;
+  - streams have deadlines: 5 s to finish a message once it starts, 10 s to
+    read an answer;
+  - a query waits at most 2 s for a `max_goroutines` worker, then gets
+    `SERVFAIL` on a stream, or is dropped on UDP.
+
+  dnsproxy waits for its semaphore forever and stops accepting while it
+  waits; the whole of it is set out under *Hardening the ports the internet
+  can reach*. None of it touches an address on the local network or in
+  `ratelimit_whitelist`, so a LAN-only installation behaves as it did.
+- **Sign-in throttling is keyed per IPv6 /64.** Upstream keys it per address
+  string, which gives every address in a /64 its own five attempts. From the
+  internet, an attempt is counted before the password is checked and handed
+  back on success, so guesses sent at once cannot all slip under the limit.
+  At most two bcrypt checks run at once, off the runtime; a sign-in that cannot
+  get one within 5 s is answered 429 with `Retry-After: 1`. A LAN or allowlisted
+  source, including anything behind a reverse proxy on the same machine, is
+  checked at once and counted afterwards, as upstream counts everyone.
+- **An oversized request body is answered 413 on the control API**, where Go
+  answers 400 when the JSON decoder hits its reader's limit. The limits are
+  upstream's: 64 KiB, and 4 MiB for `POST /control/access/set` and
+  `/control/filtering/set_rules`. DNS-over-HTTPS keeps answering 400, as it
+  did.
+- **The runtime client table is bounded at 10,000 learned entries**, and
+  discovery is keyed per public IPv6 /64 and rationed per /64. Upstream's is
+  unbounded. See the `clients.runtime` row under *Watching the third climb*.
+- **The descriptor limit is raised, and never lowered.** Go 1.26's runtime
+  raises the soft `RLIMIT_NOFILE` to the hard limit before `main`, capped on
+  macOS by `kern.maxfilesperproc`, and can lower a limit already above that
+  cap. This build raises it the same way at start-up but never lowers it.
+  Unlike Go, it does not restore the original limit for child processes,
+  because that needs `unsafe`.
+- **Strict SNI, where rustls decides differently.** rustls lowercases the
+  server name before anything here sees it, and reports an IP address sent as
+  a server name as no name at all. So the ClientID comparison ignores case,
+  and strict mode refuses an IP-literal name, where upstream would accept one
+  whose certificate lists that IP string as a DNS name. A refused handshake
+  is logged at debug rather than as upstream's warning, for the reason
+  `rustls::msgs` is filtered.
+
 ## Not implemented
 
 Nothing outstanding. The features listed under **Deliberate exclusions** above
@@ -2758,13 +2840,16 @@ Four decisions in it, each because the obvious version is worse:
 - **Bytes that do not parse as a query buy no exemption.** `serve_stream`
   counts a query only when an answer was written, so junk on the wire is
   silence. A client refused by the access list *does* count — it is answered
-  REFUSED, which makes it a client this server knows about.
+  REFUSED, which makes it a client this server knows about. *(Reversed in
+  v0.12.0: a stranger refused by `allowed_clients` is exactly the spam an
+  exposed resolver gets. See* Hardening the ports the internet can reach.*)*
 
 Wired into all four stream listeners, so the mitigation is not one transport's:
 `serve_tcp` and `serve_dot` in `sift-dns/src/server.rs`, `doq::serve`, and
 `https::serve` with `http3::serve` in `sift-api`, where any single request —
 a DoH query, a page, an asset — counts as asking something. The plain-HTTP web
-listener is left alone.
+listener is left alone. *(Since v0.12.0 only a request answered below 400
+counts; see* Hardening the ports the internet can reach.*)*
 
 The operator's escape hatch is `ratelimit_whitelist`, reused rather than a
 setting of our own: adding a field to `AdGuardHome.yaml` that the Go build does
@@ -2784,3 +2869,291 @@ because a source being refused for ten minutes is behaviour someone has to be
 able to find an explanation for. **It is not a substitute for a firewall**: it
 caps what a scanner costs, and says nothing about who should be able to reach
 the port at all.
+
+## Hardening the ports the internet can reach
+
+An operator put 443 and 853 on the internet and asked for more protection
+from scanners and spam. The guard in *Quieting the log was not the mitigation*
+refused sources that connect and ask nothing. An audit of everything else a
+stranger can reach turned up far more than that guard could see. The audit was
+read against the dependency sources in `~/.cargo/registry` and upstream's
+v0.107.79, not from memory. The worst finding was that **one exhausted
+file-descriptor limit ended the DoT and TCP/53 listeners for good**:
+`listener.accept() => r?` returned, and the caller discarded the error.
+
+### What was wrong
+
+| Finding | Where | What a stranger could do |
+|---|---|---|
+| An accept error ends the listener; the HTTPS loop spins instead | `server.rs`, `https.rs` | take DoT and TCP/53 down until a restart, or pin a core, with ~1,000 idle connections |
+| The descriptor limit is never raised | `osconf.rs` | Go ≥ 1.19 raises the soft limit to the hard one; under the same systemd unit Go had ~500k descriptors and this build 1,024 |
+| No timeouts on 443 at all | `https.rs` | hold a connection forever: hyper's header timeout is silently off without a timer |
+| Nothing after the length prefix is timed on DoT or TCP | `serve_stream` | send `FF FF` and stall: 64 KiB and a descriptor held forever |
+| Web assets decompressed per request, copied per response | `ui.rs` | pin ~45 MB per HTTP/2 connection through the public login script, unauthenticated |
+| One source can take every `max_goroutines` worker | `Server::handle_as` | fill 300 workers with slow lookups over one DoQ or HTTP/2 connection; LAN clients queue behind them |
+| QUIC buffers left at quinn's defaults, datagrams on, h3 buffering whole frames | `doq.rs`, `http3.rs` | 1.25 MB per connection for datagrams nobody reads; unbounded memory through one oversized HEADERS or control frame |
+| axum's 2 MiB body limit everywhere | `routes.rs`, `doh.rs` | buffer 2 MiB per unauthenticated request; and Go's 4 MiB `set_rules` bodies were refused |
+| Any HTTP request, and any DNS answer, clears the guard | `https.rs`, `serve_stream` | scan paths for 401s and 404s, ask `version.bind`, or get refused by `allowed_clients`, and never be counted |
+| Sign-in keyed per address; bcrypt on a runtime worker under the config lock | `routes.rs`, `misc.rs` | a fresh five attempts per address in a /64; a few parallel guesses stall the runtime that also answers DNS |
+| `tls.strict_sni_check` parsed and ignored | `model.rs` | nothing, but a setting that silently does nothing is a bug here |
+| 256-entry session cache, no ticketer | `tls.rs` | ~128 scanner handshakes evict every real client's resumption |
+| Runtime client table unbounded; a failed lookup re-queued on every query | `clients.rs`, `wiring.rs` | grow memory and outbound WHOIS without bound, and keep the lookup queue full |
+
+### What changed
+
+**The guard grew** (`sift-dns/src/probe.rs`):
+
+- **An IPv6 source is its /64.** A scanner can use a fresh address inside it
+  every time for free.
+- **A repeat offender is refused for twice as long each time,** up to a day,
+  and is forgotten after a quiet day.
+- **`condemn`** refuses a source at once for an act only an attacker commits.
+- **Three limits on what may be held at once**, never on rate:
+  - 64 connections per source;
+  - 4096 connections in all, or half the descriptor limit if that is lower;
+  - 256 handshakes in progress.
+
+  Reaching one is being busy, which is never a strike.
+- **The table is bounded** at 65,536 sources, 32 bytes each. When it is full,
+  sources with only strikes go first, then remembered offenders, then banned
+  ones.
+
+`sift-dns/src/quic.rs` writes the QUIC policy once for both QUIC listeners:
+
+- a banned source is ignored, so nothing is sent to a possibly forged address;
+- an unproven address is sent a Retry once half the handshake slots are taken;
+- a proven address over a limit is refused;
+- a source is charged its connection only once its address is proven, so a
+  forged address can never use up a victim's allowance.
+
+**What counts as asking something** is now a defence in itself:
+
+- **DNS:** `Server::answer` returns `Answer { bytes, counts }`. These do not
+  count:
+  - a refusal by the access list;
+  - a `blocked_hosts` REFUSED (a new `Outcome::blocked_host` flag, so a
+    filtering rule's REFUSED under `blocking_mode: refused` still counts);
+  - FORMERR and NOTIMP;
+  - a SERVFAIL for a refused server name or a full share.
+- **HTTP:** a request counts only when it is answered below 400 and carries no
+  `doh::Unanswered` extension. DoH sets that extension when the DNS answer does
+  not count. It is a response extension and never reaches the wire.
+- **A long run of refusals ends a connection.** 32 non-counting answers in a
+  row close it, and it is reported as asking nothing. A request is never struck
+  per 4xx, because a browser with an expired session makes a few before it
+  reaches the login page.
+
+**The exploit-probe tripwire** (`sift-api/src/shield.rs`) runs in the HTTPS and
+HTTP/3 service wrappers, not in the router the plain listener shares. It
+matches on the percent-decoded path, case-insensitively:
+
+- `CONNECT`;
+- path traversal, including encoded and backslashed forms;
+- scripts: `.php`, `.asp`, `.aspx`, `.jsp`, `.cgi`, and `cgi-bin`;
+- secrets: `.env`, `.git`, `.aws`, `.ssh` and the like, at any depth;
+- WordPress, phpMyAdmin, PHPUnit;
+- a few appliance login pages, first segment only.
+
+A match condemns the source, is answered a plain 404, and closes the
+connection. That connection is then reported as asking nothing, and so is any
+other connection closing while its source is banned: otherwise a scanner that
+fetched `/` on one connection could lift the ban `/.env` earned on another.
+`nothing_the_web_interface_or_the_router_serves_trips_the_wire` runs the
+classifier over every file in `web/build` and every route parsed out of
+`routes.rs`, so a route added later cannot trip it by accident. `/dns-query/…`
+is exempt from everything but traversal, because the ClientID after it is the
+operator's choice.
+
+**Deadlines everywhere** (`https.rs`, `server.rs`, `doq.rs`, `http3.rs`). They
+are listed for operators in `docs/encryption.md`.
+
+- On 443 they follow what is *in flight* rather than bytes moving, because an
+  HTTP/2 client answering pings looks busy at the I/O level. HTTP/1.1 keep-alive
+  is effectively 10 s idle, because hyper's header timer runs between requests
+  too; upstream's is 60 s.
+- Upgrades are off: nothing uses them, and an upgraded connection would escape
+  every deadline while holding its ticket.
+- **HTTP/3 limits:**
+  - 64 request streams and 8 unidirectional ones;
+  - a 16 KiB header section;
+  - headers due within 10 s;
+  - 64 request tasks per connection.
+- **The `Metered` wrapper.** h3 0.0.8 reads a whole HEADERS or unknown frame
+  into memory, whatever length the peer declares, and every byte it reads
+  grants the peer more credit. `Metered` follows frame headers as the bytes
+  arrive and refuses any non-DATA frame over 64 KiB before it is buffered.
+- **DoQ limits:** 64 streams (was 512), and a 66,000-byte stream window, which is
+  one maximum message plus its length.
+
+**The accept loops** share `sift_dns::server::AcceptErrors`. An error about one
+connection is passed over at once. Anything else is waited out a second at a
+time and logged once a minute with a count. A loop ends only at shutdown.
+
+**The descriptor limit** is raised at start-up the way Go 1.26's runtime raises
+it. That was confirmed against `src/syscall/rlimit.go`, and AGH's `go.mod` says
+`go 1.26.6`. An explicit `os.rlimit_nofile` still applies afterwards.
+
+**The per-source in-flight share** is in `Server::answer`, so it covers TCP,
+DoT, DoQ and DoH alike:
+
+- 32 questions at once per source, over a 1 s wait, and then SERVFAIL;
+- the share is taken before a worker, so a waiting query never holds one;
+- a `max_goroutines` worker is waited for at most 2 s.
+
+dnsproxy v0.83.2 takes its semaphore per UDP packet and per TCP connection in
+the accept loop and waits forever, so a full one stops the listener itself
+(`servertcp.go:113`, `serverudp.go:100`). That is the failure being avoided,
+so this is recorded as a deviation rather than matched.
+
+**Strict SNI**, as upstream v0.107.79 has it:
+
+- `internal/dnsforward/config.go:724` wraps certificate selection for DoT and
+  DoQ only. `internal/home/web.go:478` builds the web server's configuration
+  from a plain certificate list.
+- The names are the certificate's DNS names, or its common name if it has none.
+  `anyNameMatches` is an exact, case-sensitive match, or a wildcard as a
+  suffix match of any depth. A missing name is refused.
+- Per query, `clientIDFromClientServerName` (`clientid.go:20-49`, gated at
+  `middleware.go:128-132`) is reproduced as `Server::client_id_for`. It answers
+  SERVFAIL before access control, the query log or the statistics see the
+  query.
+
+Upstream's own `TestServer_clientIDFromDNSContext` cases are ported as a table.
+The setting switches live, and `tls.server_name` for ClientIDs now does too;
+both used to be fixed at startup. A ClientID label with an underscore is now
+SERVFAIL, as upstream answers it, rather than being used.
+
+DNS-over-HTTPS runs the same check. A ClientID in the path still wins. When
+there is none, it now takes the name the client connected with, as upstream's
+`clientIDFromDNSContextHTTPS` does, which it had never done here: the TLS server
+name, or the `Host` header on the plain listener. The HTTPS and HTTP/3
+listeners hand that name to every request as a `doh::TlsServerName` extension.
+Two small differences remain:
+
+- a path ClientID is not validated, where upstream answers an invalid one
+  `SERVFAIL`;
+- a `Host` value that Go's `SplitHostPort` rejects outright is judged as a
+  whole name.
+
+**Session resumption:** a stateless ticketer on all four configurations, with
+one ticket per handshake and 0-RTT still off. Each protocol has its own key, so
+a DoT ticket resumes nothing on HTTPS. Tickets survive a certificate reload,
+because the configurations are built once per process.
+
+**The web layer:**
+
+- **Assets** are decompressed once per process into shared `Bytes`, 1.38 MB
+  for the whole build, and the stored `.br` form is served without a copy.
+- **Body limits** are upstream's `limitRequestBody`, enforced while reading.
+- **Sign-in** is keyed per /64, counted before verifying, and verified by at
+  most two bcrypt checks at once off the runtime, each waiting up to 5 s. A
+  script sending several Basic-auth requests at once is served, not turned
+  away. `/control/profile` no longer verifies the password a second time under
+  a nested config read.
+- **`/control/debug/memory`** reports the guard's totals under `server.probes`.
+
+### Found by the review, and fixed
+
+An adversarial review of the combined change, read end to end with nothing
+taken on trust, found nine things. These were fixed before the release:
+
+- **An overload got legitimate clients banned.** Ten sources holding 32 slow
+  lookups each take all 300 workers. Every other stream query then waited 2 s
+  and got a SERVFAIL that did not count. A DoT connection made in that window
+  closed as a strike, and a DoH connection collected 32 in two seconds and was
+  closed as aimless. That was six strikes in seconds for every real client,
+  while the flood's own queries, answered SERVFAIL by the upstream, counted.
+  `Answer::busy` (DoH: `doh::Overloaded`) now marks the answers the server was
+  too busy to give. They neither count nor advance the run of refusals, and a
+  connection that saw only those is recorded with the guard not at all.
+- **A scanner could lift its own ban.** It opened a DNS connection, earned a
+  condemnation on 443, asked one real question on the open connection and
+  closed it: `served` wiped the ban and the offence count with it, so
+  escalation never built. `served` now does nothing while a penalty is running.
+- **A full sign-in table waved newcomers through uncounted.** Unknown user names
+  cost no bcrypt, so ~82k requests from a /50 kept the 16,384 entries full,
+  after which any other source guessed without limit. A full table now drops
+  lapsed entries, then non-blocking ones, oldest first. If it is still full of
+  blocks, an internet newcomer is refused with the busy 429. LAN and
+  allowlisted sources never queue for a verifier and are counted after the
+  check, exactly as Go counts everyone. Counting before the check without the
+  queue turned ten simultaneous *correct* Basic requests into a 15-minute block,
+  which the first test caught.
+- **LAN devices reaching the server at its global IPv6 address were
+  "internet".** They all shared one /64 key: 64 connections and 32 queries in
+  flight for the household, one pooled strike count, and one device tripping
+  the tripwire banned them all.
+  - `dns.private_networks` now counts as local. When it is empty, the
+    resolver's default private networks do, including `100.64.0.0/10`, which
+    `clients.rs` already treated as local. The resolver and the guard share
+    one `app::private_networks`.
+  - The host's own global IPv6 /64s are re-read every minute. A source in one
+    of them is judged per address rather than exempted, because Linode,
+    DigitalOcean and others put many customers in one /64.
+- **A port monitor was banned.** Uptime Kuma checking 443 and 853 every 20 s
+  makes six silent connections a minute. A connection that closes within
+  `SILENT_GRACE`, 1 s, without a byte now costs nothing, on every TCP
+  listener. One that lingers longer held a descriptor and a handshake slot,
+  and is still a strike: without the bound, closing just before each deadline
+  would hold both for free.
+- **The run of refusals could be reset with a redirect,** so one connection
+  could walk an unbounded wordlist by asking for `/` every 31 requests. Only a
+  2xx or a 304 resets it now.
+- **The tripwire missed some forms.** It now checks every name rule on the
+  path decoded twice (`%252eenv`). It also catches `.phtml`, `.phar` and the
+  numbered `.php` forms, and treats a NUL byte, overlong UTF-8 and IIS `%u`
+  escapes as hostile.
+- **Datagrams waiting for a worker were unbounded.** At most 1024 now wait;
+  the rest are dropped at once, as a full socket buffer drops them upstream.
+
+Left as they are, and recorded here rather than rediscovered:
+
+- **No caps at /56 or /48, and no per-source handshake cap.** A /56 holds 256
+  keys × 64 connections, more than the 4096 global cap. This is still far better
+  than before, when running out of descriptors took the LAN down with it.
+- **No API lists or lifts a ban.** A restart or `ratelimit_whitelist` does.
+- **A DoT connection that stalls mid-message after asking is a strike.** Its
+  next served connection clears it.
+- **HTTP/3's QPACK streams are never read.** Each can hold a stream window for
+  the life of its connection.
+
+### How it was verified
+
+`cargo test --workspace`: 788 tests before, 1,064 after. Each item
+above has tests that drive a real listener over loopback with the guard's
+`exempt_local` turned off. Among them:
+
+- a TLS connection that sends nothing after its handshake is dropped and
+  counted;
+- a DoT client that sends `FF FF` and stalls is dropped within the deadline;
+- a tripwire condemns its source, and the next connection is refused before
+  the handshake;
+- a page fetched before a tripwire does not lift the ban;
+- a browser-like HTTP/2 visit (302, 200, 304, three 401s, two 404s, 200) is
+  never struck;
+- an oversized HTTP/3 control frame closes the connection before it is
+  buffered;
+- 300 other handshakes in between no longer stop a client resuming;
+- strict SNI refuses a rewritten IP-literal SNI in a real ClientHello;
+- 20 parallel wrong passwords from the internet give exactly five 403s;
+- 12 parallel correct Basic requests all get 200;
+- a flood of 100,000 distinct IPv6 /64s leaves the client table at its cap.
+
+The work was split among a core guard engineer, one engineer each for the HTTP
+listeners, the DNS transports and TLS, the web layer, and client discovery.
+They worked in parallel against a shared contract. An adversarial review of
+the combined change followed.
+
+### Left alone, and why
+
+- **`TCP_IDLE` stays 30 s.** dnsproxy closes an idle TCP or DoT connection
+  after 10 s. Nothing here needs the change, and Android's Private DNS benefits
+  from the longer keep-alive.
+- **Many /64s can still fill the public lookup lane.** An attacker with a /48
+  can fill it. LAN lookups have their own lane, and the single worker bounds
+  outbound WHOIS.
+- **The tripwire's 404 tells a scanner it was caught,** where any other unknown
+  path answers 401 to a signed-out visitor. The ban is the same either way.
+- **No TCP keepalive on the sockets.** `socket2` is not a dependency, and the
+  HTTP/2 pings and idle deadlines cover dead peers.
+- **The sign-in page shows a 429's body and does not read `Retry-After`.**

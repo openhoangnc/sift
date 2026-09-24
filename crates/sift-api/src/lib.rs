@@ -7,5 +7,6 @@ pub mod https;
 pub mod netiface;
 pub mod procmem;
 pub mod routes;
+mod shield;
 pub mod state;
 pub mod ui;

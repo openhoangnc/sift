@@ -45,6 +45,8 @@ Append it to the query path:
 https://dns.example.org/dns-query/laptop
 ```
 
+Or put it in the server name, as below. The path wins when both are given.
+
 ### DNS-over-TLS and DNS-over-QUIC
 
 Put it in front of the server's own name in the TLS server name (SNI):
@@ -58,6 +60,11 @@ wildcard — `*.dns.example.org` alongside `dns.example.org`. Only the single
 label directly below the server's own name is read: a name with more labels
 under it, or an unrelated name, yields no identifier rather than having part of
 it taken as one.
+
+A label there that is not a valid ClientID — one with an underscore, say — is
+answered `SERVFAIL` rather than ignored, as upstream answers it. With
+`tls.strict_sni_check` on, so is every name other than the server's own and
+one label below it; see [Strict SNI](encryption.md#strict-sni).
 
 ### Apple devices
 

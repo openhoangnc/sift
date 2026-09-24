@@ -5,8 +5,22 @@
 //! usable, so the checks here have to be the ones a user would expect: does
 //! the chain parse, does the key parse, do they belong together, and what
 //! names and dates does the certificate carry.
+//!
+//! Two more things are about what a stranger's handshake costs:
+//!
+//! - **`tls.strict_sni_check`** refuses a DNS-over-TLS or DNS-over-QUIC
+//!   handshake whose server name the certificate does not cover, before
+//!   anything is signed -- see [`any_name_matches`] for exactly which names
+//!   pass, copied from upstream.  HTTPS and HTTP/3 never apply it, because
+//!   upstream's web server does not.
+//! - **Session resumption is stateless**, on every configuration built here.
+//!   A reconnecting client carries its own resumption state in a ticket
+//!   rather than holding one of 256 slots in a cache that every scanner's
+//!   handshake also writes to, so a scan cannot push real clients back onto
+//!   full handshakes.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -358,6 +372,116 @@ fn format_time(unix: i64) -> String {
         .unwrap_or_else(|_| sift_core::gotime::GO_ZERO_TIME.to_string())
 }
 
+/// The names a strict server-name check accepts for a certificate.
+///
+/// Upstream's `replaceGetCertificate` takes the leaf's `DNSNames` -- the
+/// subject alternative names of DNS type, IP addresses not among them -- and
+/// only when there are none, the subject's common name.  Go keeps the *last*
+/// common name the subject carries, so that is the one taken here.  A
+/// certificate with neither yields one empty name, which matches nothing: in
+/// strict mode such a certificate refuses every handshake, as upstream's does.
+fn sni_names(leaf: &CertificateDer<'_>) -> Vec<String> {
+    use x509_parser::prelude::*;
+
+    let Ok((_, cert)) = X509Certificate::from_der(leaf.as_ref()) else {
+        return Vec::new();
+    };
+
+    let mut names = Vec::new();
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for name in &san.value.general_names {
+            if let GeneralName::DNSName(n) = name {
+                names.push((*n).to_string());
+            }
+        }
+    }
+
+    if names.is_empty() {
+        let cn = cert
+            .subject()
+            .iter_common_name()
+            .filter_map(|cn| cn.as_str().ok())
+            .last()
+            .unwrap_or_default();
+        names.push(cn.to_string());
+    }
+
+    names
+}
+
+/// Reports whether the server name a client sent is one the certificate
+/// covers, exactly as upstream's `anyNameMatches` decides it.
+///
+/// ```go
+/// if !netutil.IsValidHostname(sni) && !netutil.IsValidIPString(sni) { return false }
+/// if _, ok = slices.BinarySearch(dnsNames, sni); ok { return true }
+/// for _, dn := range dnsNames { if matchesDomainWildcard(sni, dn) { return true } }
+/// ```
+///
+/// which comes to this:
+///
+/// - **No server name is refused.**  Go reports a missing one as the empty
+///   string, which is not a valid hostname.  rustls also reports an IP
+///   address sent as a server name as no server name at all, so that is
+///   refused too -- upstream would accept one only if the certificate listed
+///   the address as a *DNS* name, which no issuer does.
+/// - **An exact match passes**, compared byte for byte.  rustls hands over the
+///   name already lowercased, and upstream compares case-sensitively against
+///   the certificate as issued, so a certificate name with a capital letter
+///   in it matches nothing here -- as it matches nothing a client sending a
+///   lowercase name asks upstream for.
+/// - **A wildcard matches any depth.**  `*.example.com` is only the suffix
+///   `.example.com` to upstream, so `a.b.example.com` passes, and
+///   `example.com` itself does not.
+/// - **Anything that is not a valid hostname is refused** before it is
+///   compared, which includes a name with an underscore or a trailing dot.
+pub fn any_name_matches(names: &[String], sni: Option<&str>) -> bool {
+    let Some(sni) = sni else {
+        return false;
+    };
+
+    if !is_valid_hostname(sni) {
+        return false;
+    }
+
+    names.iter().any(|n| n == sni)
+        || names
+            .iter()
+            .any(|n| n.starts_with("*.") && sni.ends_with(&n[1..]))
+}
+
+/// Upstream's `netutil.IsValidHostname`, for the ASCII names rustls hands
+/// over: at most 253 bytes, labels of letters, digits and inner hyphens of at
+/// most 63 bytes each, and a last label that is not all digits.
+fn is_valid_hostname(name: &str) -> bool {
+    if name.is_empty() || name.len() > 253 {
+        return false;
+    }
+
+    let mut labels = name.split('.').peekable();
+    while let Some(label) = labels.next() {
+        let last = labels.peek().is_none();
+        let bytes = label.as_bytes();
+        let outer = |b: u8| b.is_ascii_alphanumeric();
+
+        let valid = match bytes {
+            [] => false,
+            [only] => outer(*only),
+            [first, inner @ .., end] => {
+                bytes.len() <= 63
+                    && outer(*first)
+                    && outer(*end)
+                    && inner.iter().all(|&b| outer(b) || b == b'-')
+            }
+        };
+        if !valid || (last && bytes.iter().all(u8::is_ascii_digit)) {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// A certificate that can be replaced while the listeners keep running.
 ///
 /// rustls takes the certificate when a `ServerConfig` is built, so a listener
@@ -365,20 +489,32 @@ fn format_time(unix: i64) -> String {
 /// certificate replaced through `/control/tls/configure` -- or rewritten on
 /// disk by whatever renews it -- takes effect on the next handshake rather
 /// than at the next restart.
+///
+/// It also carries `tls.strict_sni_check`, which the DNS-over-TLS and
+/// DNS-over-QUIC configurations built by [`reloadable`] consult on every
+/// handshake, so that saving the setting reaches running listeners the way a
+/// new certificate does.
 #[derive(Debug, Default)]
 pub struct Reloadable {
     /// The certificate currently being served.
     current: parking_lot::RwLock<Option<Slot>>,
+    /// Whether DNS-over-TLS and DNS-over-QUIC refuse a server name the
+    /// certificate does not cover.
+    strict_sni: AtomicBool,
 }
 
 /// What a [`Reloadable`] is serving, and what it was built from.
 ///
-/// One lock holds all three: a fingerprint that disagreed with the
-/// certificate beside it would send a renewal check the wrong way.
+/// One lock holds all of it: a fingerprint that disagreed with the
+/// certificate beside it would send a renewal check the wrong way, and names
+/// that belonged to another certificate would let a strict check pass or
+/// fail on the wrong one.
 #[derive(Debug)]
 struct Slot {
     /// What rustls hands to a handshake.
     key: Arc<rustls::sign::CertifiedKey>,
+    /// The names a strict server-name check accepts; see [`sni_names`].
+    names: Vec<String>,
     /// A digest of the PEM this was read from.
     fingerprint: [u8; 32],
     /// When the leaf expires, in seconds since the Unix epoch, when the
@@ -402,14 +538,29 @@ impl Reloadable {
     ) -> Result<(), Error> {
         let signing = rustls::crypto::ring::sign::any_supported_type(&key)
             .map_err(|e| Error::Rustls(format!("using the private key: {e}")))?;
+        let names = sni_names(&chain[0]);
 
         *self.current.write() = Some(Slot {
             key: Arc::new(rustls::sign::CertifiedKey::new(chain, signing)),
+            names,
             fingerprint,
             not_after,
         });
 
         Ok(())
+    }
+
+    /// Switches the strict server-name check on or off.
+    ///
+    /// This is `tls.strict_sni_check`.  It applies to DNS-over-TLS and
+    /// DNS-over-QUIC from their next handshake, and never to HTTPS or HTTP/3.
+    pub fn set_strict_sni(&self, on: bool) {
+        self.strict_sni.store(on, Ordering::Relaxed);
+    }
+
+    /// Reports whether the strict server-name check is on.
+    pub fn strict_sni(&self) -> bool {
+        self.strict_sni.load(Ordering::Relaxed)
     }
 
     /// Reports whether a certificate is installed.
@@ -441,6 +592,80 @@ impl rustls::server::ResolvesServerCert for Reloadable {
     }
 }
 
+/// The certificate resolver for DNS-over-TLS and DNS-over-QUIC, which applies
+/// `tls.strict_sni_check` when it is on.
+///
+/// Upstream wraps the certificate callback of exactly these two listeners in
+/// `replaceGetCertificate`; its web server, which carries HTTPS and
+/// DNS-over-HTTPS, is built without it.  Refusing here refuses before
+/// anything is signed, which is the whole cost of a handshake: rustls answers
+/// the ClientHello with an alert, and the listener counts the failed
+/// handshake against the source as it counts any other.
+#[derive(Debug)]
+struct StrictSni(Arc<Reloadable>);
+
+impl rustls::server::ResolvesServerCert for StrictSni {
+    fn resolve(
+        &self,
+        hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let current = self.0.current.read();
+        let slot = current.as_ref()?;
+
+        if self.0.strict_sni() && !any_name_matches(&slot.names, hello.server_name()) {
+            // Upstream warns here, once per handshake.  That is a line per
+            // connection for anyone dialling the port by address, which is
+            // what the rustls filter in `main.rs` exists to keep out of the
+            // log, so it is a debug line here.
+            tracing::debug!(
+                server_name = hello.server_name().unwrap_or_default(),
+                "unknown sni in client hello"
+            );
+
+            return None;
+        }
+
+        Some(slot.key.clone())
+    }
+}
+
+/// Makes session resumption stateless, for every listener alike.
+///
+/// rustls resumes from a 256-entry cache by default, and every handshake that
+/// completes writes to it -- a scanner's as much as a client's -- so a scan
+/// of a hundred-odd connections is enough to push every real client back
+/// onto a full handshake.  A ticket carries the state with the client
+/// instead, sealed under a key only this process holds and rotates every six
+/// hours, so there is nothing here for a scan to evict.
+///
+/// One ticket per handshake rather than rustls' two.  A client that resumes
+/// is given a fresh one each time, so a client reconnecting in turn always
+/// has one in hand; the second would only serve a client opening connections
+/// in parallel, which a DNS client and an HTTP/2 browser do not, and it would
+/// double what each scanner's handshake costs to send.
+///
+/// Each configuration gets its own ticket key, so a ticket issued for one
+/// protocol resumes nothing on another.  The key lives with the
+/// configuration, which is built once for the life of the process: a
+/// certificate installed later reaches the listeners through the resolver,
+/// not by rebuilding them, so tickets issued before a renewal still resume
+/// after it.  Across a restart they do not, and a client simply makes one
+/// full handshake.
+///
+/// Early data stays off: `max_early_data_size` is left at rustls' zero, since
+/// a replayed query is a replayed query, and quinn keeps it that way.
+fn resume_statelessly(c: &mut ServerConfig) {
+    match rustls::crypto::ring::Ticketer::new() {
+        Ok(t) => {
+            c.ticketer = t;
+            c.send_tls13_tickets = 1;
+        }
+        // Only a failure to gather randomness, which leaves the default
+        // cache in place rather than a listener that cannot start.
+        Err(e) => tracing::warn!(error = %e, "tls session tickets are unavailable"),
+    }
+}
+
 /// Digests the PEM a certificate and key were read from.
 ///
 /// Comparing the bytes is what distinguishes a renewal from a file that has
@@ -461,25 +686,31 @@ fn fingerprint(cert_pem: &str, key_pem: &str) -> [u8; 32] {
     out
 }
 
-/// Builds the three server configurations around one reloadable certificate.
+/// Builds the four server configurations around one reloadable certificate.
 ///
 /// Each listener advertises its own protocol, but they share the certificate,
-/// so replacing it reaches all of them at once.
+/// so replacing it reaches all of them at once.  DNS-over-TLS and
+/// DNS-over-QUIC resolve it through [`StrictSni`], so `tls.strict_sni_check`
+/// reaches them too; HTTPS and HTTP/3 resolve it directly.
 pub fn reloadable(resolver: Arc<Reloadable>) -> Loaded {
-    let make = |alpn: Vec<Vec<u8>>| {
-        let mut c = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(resolver.clone());
+    let make = |alpn: Vec<Vec<u8>>, strict: bool| {
+        let builder = ServerConfig::builder().with_no_client_auth();
+        let mut c = if strict {
+            builder.with_cert_resolver(Arc::new(StrictSni(resolver.clone())))
+        } else {
+            builder.with_cert_resolver(resolver.clone())
+        };
         c.alpn_protocols = alpn;
+        resume_statelessly(&mut c);
 
         Arc::new(c)
     };
 
     Loaded {
-        dot: make(vec![b"dot".to_vec()]),
-        https: make(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
-        h3: make(vec![b"h3".to_vec()]),
-        doq: make(vec![b"doq".to_vec()]),
+        dot: make(vec![b"dot".to_vec()], true),
+        https: make(vec![b"h2".to_vec(), b"http/1.1".to_vec()], false),
+        h3: make(vec![b"h3".to_vec()], false),
+        doq: make(vec![b"doq".to_vec()], true),
         status: Status::default(),
     }
 }
@@ -593,6 +824,10 @@ pub fn load(src: &Source) -> Result<Loaded, Error> {
     // and clients that still send them are simply not served.
     let mut doq = build(chain, key)?;
     doq.alpn_protocols = vec![b"doq".to_vec()];
+
+    for c in [&mut dot, &mut https, &mut h3, &mut doq] {
+        resume_statelessly(c);
+    }
 
     status.valid_pair = true;
 
@@ -1032,5 +1267,397 @@ mod tests {
     fn a_certificate_without_ip_names_says_so() {
         let (c, k) = self_signed(&["localhost"]);
         assert!(!inspect(&inline(&c, &k)).has_ip_addresses);
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn a_strict_check_accepts_what_upstreams_any_name_matches_accepts() {
+        // Each case is a line of upstream's `anyNameMatches`, and the table
+        // in its `config_internal_test.go` besides.
+        let cert = names(&["dns.example.com", "*.wild.example.com"]);
+        let yes = |sni: &str| any_name_matches(&cert, Some(sni));
+
+        assert!(yes("dns.example.com"), "an exact name");
+        assert!(yes("a.wild.example.com"), "one label under a wildcard");
+        assert!(
+            yes("a.b.wild.example.com"),
+            "a wildcard is a suffix to upstream, so any depth passes"
+        );
+
+        assert!(
+            !yes("wild.example.com"),
+            "the wildcard does not cover its apex"
+        );
+        assert!(!yes("example.com"));
+        assert!(!yes("other.example.net"));
+        assert!(!yes("xdns.example.com"), "a suffix is not a name");
+        assert!(!any_name_matches(&cert, None), "no server name at all");
+
+        // Not valid hostnames, so refused before they are compared.
+        assert!(!yes("dns.example.com."), "a trailing dot");
+        assert!(!yes("under_score.wild.example.com"));
+        assert!(!yes("-a.wild.example.com"));
+        assert!(
+            !any_name_matches(&names(&["*.123"]), Some("x.123")),
+            "an all-numeric last label"
+        );
+    }
+
+    #[test]
+    fn a_strict_check_compares_the_certificates_names_as_issued() {
+        // rustls lowercases what the client sent; upstream compares against
+        // the certificate byte for byte, so a capital in the certificate
+        // matches no lowercase name there, and none here.
+        assert!(!any_name_matches(
+            &names(&["DNS.example.com"]),
+            Some("dns.example.com")
+        ));
+        assert!(any_name_matches(
+            &names(&["dns.example.com"]),
+            Some("dns.example.com")
+        ));
+    }
+
+    #[test]
+    fn hostname_validity_is_upstreams() {
+        for good in [
+            "a",
+            "a.b",
+            "xn--80ak6aa92e.com",
+            "1.example",
+            "a-b.c",
+            &"a".repeat(63),
+        ] {
+            assert!(is_valid_hostname(good), "{good:?}");
+        }
+        for bad in [
+            "",
+            ".",
+            "a..b",
+            "a.",
+            "-a",
+            "a-",
+            "a_b",
+            "1.2.3.4",
+            &"a".repeat(64),
+            &format!("{}com", "a.".repeat(126)),
+        ] {
+            assert!(!is_valid_hostname(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_certificate_without_dns_names_is_known_by_its_common_name() {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "first.example");
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress("192.0.2.1".parse().unwrap()));
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+
+        // An IP address is not a DNS name to Go, so the common name stands in.
+        assert_eq!(sni_names(cert.der()), ["first.example"]);
+
+        let (c, _) = self_signed(&["a.example", "b.example"]);
+        let der = parse_chain(&c).unwrap();
+        assert_eq!(sni_names(&der[0]), ["a.example", "b.example"]);
+    }
+
+    /// A client that trusts anything, so the tests can offer server names
+    /// the certificate does not cover and see what the *server* does.
+    #[derive(Debug)]
+    struct TrustAnything;
+
+    impl rustls::client::danger::ServerCertVerifier for TrustAnything {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &rustls_pki_types::ServerName<'_>,
+            _: &[u8],
+            _: rustls_pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// A client for `alpn` that trusts anything and sends `sni`, or no
+    /// server name at all.
+    fn client(alpn: &[u8], sni: Option<&str>) -> (Arc<rustls::ClientConfig>, ServerNameOwned) {
+        let mut c = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(TrustAnything))
+            .with_no_client_auth();
+        c.alpn_protocols = vec![alpn.to_vec()];
+        c.enable_sni = sni.is_some();
+
+        let name = ServerNameOwned::try_from(sni.unwrap_or("unsent.invalid").to_string()).unwrap();
+
+        (Arc::new(c), name)
+    }
+
+    type ServerNameOwned = rustls_pki_types::ServerName<'static>;
+
+    /// Moves everything `from` has to send into `to`, returning `to`'s
+    /// verdict on it.
+    fn deliver(
+        from: &mut impl std::ops::DerefMut<Target = rustls::ConnectionCommon<impl Sized>>,
+        to: &mut impl std::ops::DerefMut<Target = rustls::ConnectionCommon<impl Sized>>,
+    ) -> Result<(), rustls::Error> {
+        let mut wire = Vec::new();
+        while from.wants_write() {
+            from.write_tls(&mut wire).unwrap();
+        }
+
+        let mut rest = &wire[..];
+        while !rest.is_empty() {
+            to.read_tls(&mut rest).unwrap();
+            to.process_new_packets()?;
+        }
+
+        Ok(())
+    }
+
+    /// Runs a whole handshake in memory, and the tickets after it.
+    fn handshake(
+        server: &Arc<ServerConfig>,
+        (client, name): &(Arc<rustls::ClientConfig>, ServerNameOwned),
+    ) -> Result<rustls::ClientConnection, rustls::Error> {
+        let mut c = rustls::ClientConnection::new(client.clone(), name.clone()).unwrap();
+        let mut s = rustls::ServerConnection::new(server.clone()).unwrap();
+
+        for _ in 0..8 {
+            deliver(&mut c, &mut s)?;
+            deliver(&mut s, &mut c)?;
+        }
+        assert!(
+            !c.is_handshaking() && !s.is_handshaking(),
+            "stuck mid-handshake"
+        );
+
+        Ok(c)
+    }
+
+    /// Four configurations around one reloadable certificate for `names`.
+    fn listening(names: &[&str], strict: bool) -> Loaded {
+        let (cert, key) = self_signed(names);
+        let slot = Arc::new(Reloadable::new());
+        install(&inline(&cert, &key), &slot).unwrap();
+        slot.set_strict_sni(strict);
+
+        reloadable(slot)
+    }
+
+    #[test]
+    fn strict_sni_refuses_a_name_the_certificate_does_not_cover_on_dot_and_doq() {
+        let tls = listening(&["dns.example.com"], true);
+
+        for (cfg, alpn) in [(&tls.dot, &b"dot"[..]), (&tls.doq, &b"doq"[..])] {
+            assert!(handshake(cfg, &client(alpn, Some("dns.example.com"))).is_ok());
+            assert!(
+                handshake(cfg, &client(alpn, Some("other.example.com"))).is_err(),
+                "a name the certificate does not cover"
+            );
+            assert!(
+                handshake(cfg, &client(alpn, None)).is_err(),
+                "no server name is refused too"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_sni_never_reaches_https_or_http3() {
+        // Upstream's web server is built with a plain certificate list.
+        let tls = listening(&["dns.example.com"], true);
+
+        for (cfg, alpn) in [(&tls.https, &b"h2"[..]), (&tls.h3, &b"h3"[..])] {
+            assert!(handshake(cfg, &client(alpn, Some("other.example.com"))).is_ok());
+            assert!(handshake(cfg, &client(alpn, None)).is_ok());
+        }
+    }
+
+    #[test]
+    fn without_strict_sni_any_name_is_served() {
+        let tls = listening(&["dns.example.com"], false);
+
+        assert!(handshake(&tls.dot, &client(b"dot", Some("other.example.com"))).is_ok());
+        assert!(handshake(&tls.dot, &client(b"dot", None)).is_ok());
+    }
+
+    #[test]
+    fn strict_sni_can_be_switched_on_a_running_listener() {
+        let (cert, key) = self_signed(&["dns.example.com"]);
+        let slot = Arc::new(Reloadable::new());
+        install(&inline(&cert, &key), &slot).unwrap();
+        let tls = reloadable(slot.clone());
+        let stranger = client(b"dot", Some("other.example.com"));
+
+        assert!(handshake(&tls.dot, &stranger).is_ok());
+        slot.set_strict_sni(true);
+        assert!(handshake(&tls.dot, &stranger).is_err());
+    }
+
+    #[test]
+    fn a_clientid_below_a_wildcard_certificate_passes_strict_sni() {
+        // How ClientIDs are meant to be used over DoT: a certificate for the
+        // server's name and everything below it, and a label per device.
+        let tls = listening(&["dns.example.com", "*.dns.example.com"], true);
+
+        assert!(
+            handshake(
+                &tls.dot,
+                &client(b"dot", Some("kids-tablet.dns.example.com"))
+            )
+            .is_ok()
+        );
+        assert!(handshake(&tls.dot, &client(b"dot", Some("dns.example.com"))).is_ok());
+    }
+
+    #[test]
+    fn strict_sni_refuses_an_address_sent_as_a_server_name() {
+        // What a scanner dialling the port by address sends.  rustls reads an
+        // IP literal as no server name, and a strict check refuses that
+        // before anything is signed; without it the handshake goes ahead.
+        //
+        // rustls will not send an address as a server name, so a name of the
+        // same length is sent and rewritten on the way.
+        let first_flight = |strict: bool| {
+            let tls = listening(&["dns.example.com"], strict);
+            let (cfg, name) = client(b"dot", Some("abc.xyz"));
+            let mut c = rustls::ClientConnection::new(cfg, name).unwrap();
+            let mut s = rustls::ServerConnection::new(tls.dot.clone()).unwrap();
+
+            let mut hello = Vec::new();
+            while c.wants_write() {
+                c.write_tls(&mut hello).unwrap();
+            }
+            let at = hello
+                .windows(7)
+                .position(|w| w == b"abc.xyz")
+                .expect("the server name is in the hello");
+            hello[at..at + 7].copy_from_slice(b"1.2.3.4");
+
+            s.read_tls(&mut &hello[..]).unwrap();
+            s.process_new_packets().map(|_| ())
+        };
+
+        assert!(first_flight(true).is_err(), "refused at the ClientHello");
+        assert!(first_flight(false).is_ok(), "served without the check");
+    }
+
+    #[test]
+    fn a_reinstalled_certificate_brings_its_own_names() {
+        let slot = Arc::new(Reloadable::new());
+        slot.set_strict_sni(true);
+        let tls = reloadable(slot.clone());
+
+        let (cert, key) = self_signed(&["first.example"]);
+        install(&inline(&cert, &key), &slot).unwrap();
+        assert!(handshake(&tls.dot, &client(b"dot", Some("first.example"))).is_ok());
+
+        let (cert, key) = self_signed(&["second.example"]);
+        install(&inline(&cert, &key), &slot).unwrap();
+        assert!(handshake(&tls.dot, &client(b"dot", Some("first.example"))).is_err());
+        assert!(handshake(&tls.dot, &client(b"dot", Some("second.example"))).is_ok());
+    }
+
+    #[test]
+    fn every_configuration_resumes_from_a_ticket_and_never_early() {
+        let reloaded = listening(&["dns.example.com"], false);
+        let (cert, key) = self_signed(&["dns.example.com"]);
+        let loaded = load(&inline(&cert, &key)).unwrap();
+
+        for tls in [&reloaded, &loaded] {
+            for cfg in [&tls.dot, &tls.https, &tls.h3, &tls.doq] {
+                assert!(cfg.ticketer.enabled(), "stateless resumption");
+                assert_eq!(cfg.send_tls13_tickets, 1);
+                assert_eq!(cfg.max_early_data_size, 0, "no 0-RTT");
+            }
+        }
+    }
+
+    #[test]
+    fn a_client_that_reconnects_resumes_rather_than_handshaking_again() {
+        use rustls::HandshakeKind;
+
+        let tls = listening(&["dns.example.com"], true);
+        let dot = client(b"dot", Some("dns.example.com"));
+
+        let first = handshake(&tls.dot, &dot).unwrap();
+        assert_eq!(first.handshake_kind(), Some(HandshakeKind::Full));
+
+        // The same client config holds the ticket the first handshake left.
+        let again = handshake(&tls.dot, &dot).unwrap();
+        assert_eq!(
+            again.handshake_kind(),
+            Some(HandshakeKind::Resumed),
+            "resumed, and through the strict check"
+        );
+    }
+
+    #[test]
+    fn a_scan_of_handshakes_does_not_push_a_client_out_of_resumption() {
+        // The point of tickets.  rustls' default cache holds 256 sessions
+        // and forgets the oldest, so this many strangers completing a
+        // handshake in between used to cost the client its resumption.
+        use rustls::HandshakeKind;
+
+        let tls = listening(&["dns.example.com"], false);
+        let regular = client(b"dot", Some("dns.example.com"));
+        handshake(&tls.dot, &regular).unwrap();
+
+        for _ in 0..300 {
+            handshake(&tls.dot, &client(b"dot", Some("dns.example.com"))).unwrap();
+        }
+
+        let back = handshake(&tls.dot, &regular).unwrap();
+        assert_eq!(back.handshake_kind(), Some(HandshakeKind::Resumed));
+    }
+
+    #[test]
+    fn a_ticket_for_one_protocol_resumes_nothing_on_another() {
+        use rustls::HandshakeKind;
+
+        let tls = listening(&["dns.example.com"], false);
+        let (cfg, name) = client(b"dot", Some("dns.example.com"));
+        handshake(&tls.dot, &(cfg.clone(), name.clone())).unwrap();
+
+        // The ticket is in `cfg`'s store; offer it to the DoQ configuration,
+        // whose ticket key is its own.
+        let mut other = (*cfg).clone();
+        other.alpn_protocols = vec![b"doq".to_vec()];
+        let crossed = handshake(&tls.doq, &(Arc::new(other), name)).unwrap();
+        assert_eq!(crossed.handshake_kind(), Some(HandshakeKind::Full));
     }
 }

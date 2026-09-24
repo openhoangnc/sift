@@ -64,13 +64,16 @@ impl Recorder {
         *self.runtime.write() = Some(runtime);
     }
 
-    /// Asks for a name for a client that has none yet.
+    /// Notes that a client asked something, and asks for a name for one that
+    /// has none yet.
+    ///
+    /// Noting it is what keeps a device in use in the runtime table when a
+    /// flood of strangers fills it.  An address that is still unknown is
+    /// offered to discovery on every query, which is cheap: discovery holds
+    /// back one it is already looking up or has lately failed to name, rather
+    /// than this re-queueing it each time and crowding out everybody else.
     fn note_client(&self, addr: std::net::IpAddr) {
-        let known = self
-            .runtime
-            .read()
-            .as_ref()
-            .is_some_and(|r| r.is_known(addr));
+        let known = self.runtime.read().as_ref().is_some_and(|r| r.touch(addr));
         if known {
             return;
         }
@@ -391,7 +394,10 @@ impl Reloader for LiveReloader {
             subnet_len_v6: cfg.dns.ratelimit_subnet_len_ipv6,
             allowlist: cfg.dns.ratelimit_whitelist.clone(),
         });
-        self.server.probes.set_config(crate::app::probe_config(cfg));
+        // Through the server, whose bound on queries in flight asks the guard
+        // whom it exempts.  This rereads the host's own networks too, so a
+        // save picks up a renumbered prefix without waiting for the tick.
+        self.server.set_probe_config(crate::app::probe_config(cfg));
         self.resolver
             .cache
             .set_config(crate::app::cache_config(cfg));
@@ -466,10 +472,17 @@ impl LiveReloader {
 
     /// Installs the configured certificate into the running listeners.
     ///
-    /// Only the certificate is live-reloadable: which ports are bound is
-    /// decided when the listeners start, so changing a port still needs a
-    /// restart.
+    /// The certificate, the server name a ClientID is read from and
+    /// `strict_sni_check` are live: upstream restarts its DNS server with
+    /// them on a TLS change.  Which ports are bound is decided when the
+    /// listeners start, so changing a port still needs a restart.
     fn reload_certificate(&self, cfg: &Config) {
+        // Before the early return: switching encryption off clears the name,
+        // as upstream's empty TLS configuration does.
+        let (name, strict) = crate::app::server_name(cfg);
+        self.server.set_server_name(name, strict);
+        self.certificate.set_strict_sni(cfg.tls.strict_sni_check);
+
         let src = crate::app::tls_source(cfg);
 
         if !cfg.tls.enabled || src.is_empty() {

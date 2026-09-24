@@ -357,9 +357,6 @@ async fn run(args: Args, paths: Paths, mut config: sift_config::Config) -> anyho
 
     if let Some(tls) = tls {
         let cfg = &application.config;
-        // A ClientID reaches an encrypted listener as a label below the name
-        // the certificate is for.
-        let server_name = Arc::new(cfg.tls.server_name.clone());
 
         // HTTPS carries both the web interface and DNS-over-HTTPS, as upstream
         // serves them.
@@ -411,10 +408,11 @@ async fn run(args: Args, paths: Paths, mut config: sift_config::Config) -> anyho
                     Ok(ep) => {
                         tracing::info!(%addr, "serving dns-over-quic");
                         let server = application.server.clone();
-                        let name = server_name.clone();
                         let mut rx = shutdown_rx.clone();
+                        // A ClientID reaches it as a label below
+                        // `tls.server_name`, which the server holds.
                         tasks.push(tokio::spawn(async move {
-                            sift_dns::doq::serve(ep, server, name, async move {
+                            sift_dns::doq::serve(ep, server, async move {
                                 let _ = rx.changed().await;
                             })
                             .await;
@@ -433,10 +431,11 @@ async fn run(args: Args, paths: Paths, mut config: sift_config::Config) -> anyho
                         tracing::info!(%addr, "serving dns-over-tls");
                         let server = application.server.clone();
                         let dot = tls.dot.clone();
-                        let name = server_name.clone();
                         let mut rx = shutdown_rx.clone();
+                        // Returns only at shutdown: an error accepting is
+                        // waited out rather than closing the port.
                         tasks.push(tokio::spawn(async move {
-                            let _ = sift_dns::server::serve_dot(l, dot, server, name, async move {
+                            sift_dns::server::serve_dot(l, dot, server, async move {
                                 let _ = rx.changed().await;
                             })
                             .await;
@@ -459,6 +458,7 @@ async fn run(args: Args, paths: Paths, mut config: sift_config::Config) -> anyho
         state.clone(),
         stats_path.clone(),
         watched,
+        application.server.clone(),
         shutdown_rx.clone(),
     )));
 
@@ -502,6 +502,10 @@ fn login_limiter(cfg: &sift_config::Config) -> sift_api::auth::LoginLimiter {
 
 /// Installs the configured certificate, reporting whether encryption can run.
 fn load_tls(cfg: &sift_config::Config, into: &sift_dns::tls::Reloadable) -> bool {
+    // DNS-over-TLS and DNS-over-QUIC read it from the slot on every
+    // handshake; a settings save sets it again through the reloader.
+    into.set_strict_sni(cfg.tls.strict_sni_check);
+
     if !cfg.tls.enabled {
         return false;
     }
@@ -679,7 +683,45 @@ impl CertWatch {
     }
 }
 
-/// Runs the periodic upkeep the server needs.
+/// Keeps the connection guard's idea of this host's own networks current.
+///
+/// Inside the /64 of each of the host's global IPv6 addresses the guard
+/// judges every address on its own rather than the /64 as one source, and
+/// those addresses are not fixed: an ISP renumbers the prefix it delegates,
+/// sometimes daily, and a household that suddenly reaches the server from a
+/// /64 the guard does not know is one shared source again.  Reading
+/// the interfaces is one system call, so the maintenance tick does it every
+/// minute and hands the guard a new configuration only when something moved.
+/// A settings save rereads them as well, through `app::probe_config`.
+#[derive(Default)]
+struct HostWatch {
+    /// What the guard was last given, or `None` before the first tick.
+    last: Option<Vec<(std::net::IpAddr, u8)>>,
+}
+
+impl HostWatch {
+    /// Takes the networks read now, and returns them when the guard should
+    /// be given them: on the first tick, and whenever they change.
+    fn changed(&mut self, now: Vec<(std::net::IpAddr, u8)>) -> Option<Vec<(std::net::IpAddr, u8)>> {
+        if self.last.as_ref() == Some(&now) {
+            return None;
+        }
+
+        // The first reading is what startup already used, so only a change
+        // after it is news.
+        if self.last.is_some() {
+            let nets: Vec<String> = now.iter().map(|(a, b)| format!("{a}/{b}")).collect();
+            tracing::info!(
+                networks = ?nets,
+                "this host's IPv6 prefixes changed; each address in them is judged on its own"
+            );
+        }
+        self.last = Some(now.clone());
+
+        Some(now)
+    }
+}
+
 /// Turns protection back on when a timed pause runs out.
 ///
 /// Its own task rather than a line in `maintenance`, because that ticks once a
@@ -703,15 +745,18 @@ async fn protection_watch(state: Shared, mut shutdown: tokio::sync::watch::Recei
     }
 }
 
+/// Runs the periodic upkeep the server needs.
 async fn maintenance(
     state: Shared,
     stats_path: std::path::PathBuf,
     certificate: Option<Arc<sift_dns::tls::Reloadable>>,
+    server: Arc<sift_dns::server::Server>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     // Only when encrypted listeners are actually running: replacing a
     // certificate nothing serves would log a reload that reached nobody.
     let mut certificate = certificate.map(CertWatch::new);
+    let mut host = HostWatch::default();
 
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -755,6 +800,11 @@ async fn maintenance(
 
         if let Some(w) = certificate.as_mut() {
             w.check(&state);
+        }
+
+        if let Some(nets) = host.changed(app::host_networks()) {
+            let cfg = app::probe_config_for(&state.config.read(), nets);
+            server.set_probe_config(cfg);
         }
 
         // Refresh any list whose own interval has elapsed, checked every
@@ -917,6 +967,25 @@ mod tests {
             Some(super::Expiry::Soon(604_799)),
             "an hour on, it is worth saying again"
         );
+    }
+
+    #[test]
+    fn the_guard_is_given_the_hosts_networks_first_and_then_only_when_they_move() {
+        let net = |s: &str| -> Vec<(std::net::IpAddr, u8)> { vec![(s.parse().unwrap(), 64)] };
+        let mut w = super::HostWatch::default();
+
+        assert_eq!(
+            w.changed(net("2001:db8:1:2::")),
+            Some(net("2001:db8:1:2::"))
+        );
+        assert_eq!(w.changed(net("2001:db8:1:2::")), None, "nothing moved");
+
+        // The ISP renumbers the delegated prefix.
+        assert_eq!(
+            w.changed(net("2001:db8:9:2::")),
+            Some(net("2001:db8:9:2::"))
+        );
+        assert_eq!(w.changed(Vec::new()), Some(Vec::new()), "or takes it away");
     }
 
     #[test]

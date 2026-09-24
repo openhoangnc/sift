@@ -1,6 +1,6 @@
 //! Building a running server from a configuration file.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -144,7 +144,9 @@ impl App {
 
         let server = Arc::new(Server::new(resolver.clone(), limiter, observer));
         server.set_max_concurrent(config.dns.max_goroutines);
-        server.probes.set_config(probe_config(&config));
+        server.set_probe_config(probe_config(&config));
+        let (name, strict) = server_name(&config);
+        server.set_server_name(name, strict);
         *server.access.write() =
             Access::new(&config.dns.allowed_clients, &config.dns.disallowed_clients);
 
@@ -188,7 +190,9 @@ impl App {
                 let server = self.server.clone();
                 let mut rx = shutdown.clone();
                 tasks.push(tokio::spawn(async move {
-                    let _ = serve_udp(sock, server, async move {
+                    // Returns only at shutdown: an error reading the socket
+                    // is ridden out rather than closing the port.
+                    serve_udp(sock, server, async move {
                         let _ = rx.changed().await;
                     })
                     .await;
@@ -200,7 +204,9 @@ impl App {
                 let server = self.server.clone();
                 let mut rx = shutdown.clone();
                 tasks.push(tokio::spawn(async move {
-                    let _ = serve_tcp(listener, server, async move {
+                    // Likewise: an error accepting is waited out, so this
+                    // ends only when asked to.
+                    serve_tcp(listener, server, async move {
                         let _ = rx.changed().await;
                     })
                     .await;
@@ -415,29 +421,95 @@ pub fn settings(c: &Config) -> Settings {
         ddr: ddr_endpoints(c),
         pending_enabled: c.dns.pending_requests.enabled,
         services_schedule: schedule(&c.filtering.blocked_services.schedule),
-        private_networks: if c.dns.private_networks.is_empty() {
-            sift_dns::resolver::default_private_networks()
-        } else {
-            c.dns
-                .private_networks
-                .iter()
-                .map(|p| (p.addr, p.bits))
-                .collect()
-        },
+        private_networks: private_networks(c),
         use_private_ptr_resolvers: c.dns.use_private_ptr_resolvers,
     }
 }
 
+/// The networks the operator calls private: `dns.private_networks`, or
+/// upstream's defaults when it is empty.
+///
+/// One list for both things that ask: the resolver, which routes a `PTR`
+/// for these to the local resolvers, and the connection guard, which treats
+/// a client from them as local.
+pub fn private_networks(c: &Config) -> Vec<(IpAddr, u8)> {
+    if c.dns.private_networks.is_empty() {
+        sift_dns::resolver::default_private_networks()
+    } else {
+        c.dns
+            .private_networks
+            .iter()
+            .map(|p| (p.addr, p.bits))
+            .collect()
+    }
+}
+
 /// The connection guard's settings, which are the defaults plus the
-/// operator's own exemptions.
+/// operator's own exemptions, with the connection budget sized to the
+/// descriptors the process has.
 ///
 /// `ratelimit_whitelist` is reused rather than a setting of our own: an
 /// address the operator has already exempted from one defence is exempt from
 /// this one, and the config file stays exactly what the Go build writes.
+/// What counts as local is [`private_networks`].  The /64s of this host's
+/// own global IPv6 addresses, read from its interfaces now, are not local
+/// but judged one address at a time -- see
+/// [`sift_dns::probe::Config::host_networks`] for why not exempt, and
+/// [`sift_dns::probe::host_networks`] for why nothing wider.  The interfaces
+/// can change under a running server -- an ISP renumbers a delegated prefix
+/// -- so the maintenance tick reads them again.
 pub fn probe_config(config: &Config) -> sift_dns::probe::Config {
+    probe_config_for(config, host_networks())
+}
+
+/// [`probe_config`] with the host's networks given rather than read.
+pub fn probe_config_for(config: &Config, host: Vec<(IpAddr, u8)>) -> sift_dns::probe::Config {
     sift_dns::probe::Config {
         allowlist: config.dns.ratelimit_whitelist.clone(),
+        local_networks: private_networks(config),
+        host_networks: host,
+        max_connections: connection_budget(crate::osconf::nofile_limit()),
         ..Default::default()
+    }
+}
+
+/// The /64 of each global IPv6 address this host's interfaces carry now.
+pub fn host_networks() -> Vec<(IpAddr, u8)> {
+    sift_dns::probe::host_networks(sift_api::netiface::addresses())
+}
+
+/// How many connections the internet may hold open at once, given the soft
+/// descriptor limit.
+///
+/// Each one is a descriptor, and so is everything else the process does --
+/// the listening sockets, a socket per upstream query in flight, the log and
+/// the databases -- and running out of them is what stops a listener
+/// accepting anything at all.  So connections get at most half, and never
+/// more than the guard's own default: under a systemd unit's 1,024 that is
+/// 512, and with the half-million Go's runtime raises the limit to, the
+/// default of 4,096.  An unlimited or unknown limit leaves the default.
+pub fn connection_budget(soft_limit: Option<u64>) -> usize {
+    let default = sift_dns::probe::Config::default().max_connections;
+
+    soft_limit.map_or(default, |limit| {
+        // Never zero, which the guard reads as no limit at all.
+        usize::try_from(limit / 2)
+            .unwrap_or(usize::MAX)
+            .clamp(1, default)
+    })
+}
+
+/// The name encrypted clients connect to, and whether they must: what the
+/// DNS server is given as `tls.server_name` and `tls.strict_sni_check`.
+///
+/// Both empty while encryption is off, as upstream's `newDNSTLSConfig`
+/// hands its DNS server an empty TLS configuration then -- so no ClientID is
+/// read from a name and none is refused.
+pub fn server_name(c: &Config) -> (&str, bool) {
+    if c.tls.enabled {
+        (c.tls.server_name.as_str(), c.tls.strict_sni_check)
+    } else {
+        ("", false)
     }
 }
 
@@ -759,6 +831,112 @@ mod tests {
         let s = settings(&c);
         assert_eq!(s.blocking.custom_v4.unwrap().to_string(), "10.0.0.1");
         assert_eq!(s.blocking.custom_v6.unwrap().to_string(), "::1");
+    }
+
+    #[test]
+    fn connections_get_half_the_descriptors_and_never_more_than_the_default() {
+        let default = sift_dns::probe::Config::default().max_connections;
+
+        assert_eq!(
+            connection_budget(Some(1024)),
+            512,
+            "a systemd unit's soft limit"
+        );
+        assert_eq!(connection_budget(Some(256)), 128, "darwin's default");
+        assert_eq!(connection_budget(Some(524_287)), default);
+        assert_eq!(connection_budget(None), default, "unlimited, or unknown");
+        // Zero is no limit at all to the guard, so it is never that.
+        assert_eq!(connection_budget(Some(1)), 1);
+        assert_eq!(connection_budget(Some(0)), 1);
+    }
+
+    #[test]
+    fn the_guard_is_sized_to_the_process() {
+        let c = test_config();
+        assert_eq!(
+            probe_config(&c).max_connections,
+            connection_budget(crate::osconf::nofile_limit())
+        );
+    }
+
+    /// A guard built from `c`, on a host whose one global address is
+    /// `2001:db8:aa:bb::53` beside a public IPv4 one.
+    fn guard_for(c: &Config) -> sift_dns::probe::Guard {
+        let host = sift_dns::probe::host_networks(
+            ["2001:db8:aa:bb::53", "203.0.113.53"]
+                .iter()
+                .map(|s| s.parse().unwrap()),
+        );
+
+        sift_dns::probe::Guard::new(probe_config_for(c, host))
+    }
+
+    #[test]
+    fn the_guard_calls_local_what_the_resolver_calls_private() {
+        let mut c = test_config();
+        let g = guard_for(&c);
+        let local = |ip: &str| g.exempts(ip.parse().unwrap());
+
+        assert!(
+            local("100.64.0.1"),
+            "the defaults, shared address space too"
+        );
+        assert!(!local("203.0.113.54"), "not a public IPv4 neighbour");
+
+        c.dns.private_networks = vec![sift_config::types::Prefix {
+            addr: "198.51.100.0".parse().unwrap(),
+            bits: 24,
+        }];
+        let g = guard_for(&c);
+        let local = |ip: &str| g.exempts(ip.parse().unwrap());
+        assert!(local("198.51.100.9"), "the operator's own list");
+        assert!(!local("100.64.0.1"), "which replaces the defaults");
+        assert!(local("192.168.1.1"), "but not what every host has");
+        assert_eq!(
+            private_networks(&c),
+            settings(&c).private_networks,
+            "and the resolver reads the same list"
+        );
+    }
+
+    #[test]
+    fn the_guard_judges_each_address_in_the_hosts_own_slash_64_on_its_own() {
+        // Not exempt: on a rented server the /64 may be shared with other
+        // customers.  But not one source either, which a household reaching
+        // the server by its global address would all have to share.
+        let g = guard_for(&test_config());
+        let ip = |s: &str| -> std::net::IpAddr { s.parse().unwrap() };
+
+        for device in ["2001:db8:aa:bb:1c2d::1", "2001:db8:aa:bb:1c2d::2"] {
+            assert!(!g.exempts(ip(device)), "{device} is judged");
+        }
+        assert_ne!(
+            g.source(ip("2001:db8:aa:bb:1c2d::1")),
+            g.source(ip("2001:db8:aa:bb:1c2d::2"))
+        );
+        assert_eq!(
+            g.source(ip("2001:db8:aa:bc::1")),
+            g.source(ip("2001:db8:aa:bc::2")),
+            "the next /64 is one source, as anywhere else"
+        );
+
+        let host = vec![(ip("2001:db8:aa:bb::"), 64)];
+        let cfg = probe_config_for(&test_config(), host.clone());
+        assert_eq!(cfg.host_networks, host);
+        assert!(!cfg.local_networks.contains(&host[0]));
+    }
+
+    #[test]
+    fn the_server_name_reaches_dns_only_while_encryption_is_on() {
+        let mut c = test_config();
+        c.tls.server_name = "dns.example.com".into();
+        c.tls.strict_sni_check = true;
+
+        c.tls.enabled = false;
+        assert_eq!(server_name(&c), ("", false));
+
+        c.tls.enabled = true;
+        assert_eq!(server_name(&c), ("dns.example.com", true));
     }
 
     #[test]

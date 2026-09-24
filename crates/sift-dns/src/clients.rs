@@ -8,10 +8,12 @@
 //! file, the ARP table or a reverse lookup, and is what the query log shows
 //! next to an address.
 
-use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 
+use ahash::AHashMap;
 use parking_lot::RwLock;
 use sift_core::schedule::Weekly;
 use sift_filter::engine::Engine;
@@ -59,7 +61,7 @@ pub struct RuntimeClient {
 }
 
 /// Which discovery sources are switched on.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sources {
     /// Look names up over WHOIS.
     pub whois: bool,
@@ -73,19 +75,162 @@ pub struct Sources {
     pub hosts: bool,
 }
 
-/// The store of clients discovered at run time.
+/// The most runtime clients the network may add.
+///
+/// Upstream keeps every address it has ever named, for the life of the
+/// process (`runtimeIndex`, `internal/client/runtimeindex.go`), which a home
+/// network bounds by itself -- 19 addresses on the deployment `TASK.md`
+/// measured.  A resolver reachable from the internet has no such bound: every
+/// distinct source that asks it anything is looked up, and one rotating
+/// through its own /64 is a new source per query.
+///
+/// Ten thousand is five hundred times what a home network holds, so an
+/// installation that never saw a stranger never reaches it and behaves exactly
+/// as before; it is also the size upstream gives its own reverse-lookup and
+/// WHOIS caches (`defaultCacheSize`, `internal/client/addrproc.go`).  At the
+/// cap the table costs about 4.6 MB, measured: 112 bytes an entry in a table
+/// that has grown to 16,384 slots, 1.9 MB, and 273 bytes more on the heap for
+/// an entry carrying a reverse name and a full WHOIS record, before the
+/// allocator rounds them up.
+///
+/// What this machine supplied -- a name from the hosts file, a name or a
+/// hardware address from the ARP table -- is not counted and never given up.
+/// It is bounded by those files, and a persistent client identified by MAC
+/// is recognised only while its address keeps the hardware address the ARP
+/// table gave it.
+pub const MAX_RUNTIME: usize = 10_000;
+
+/// How long after it was first recorded an address must ask again to count
+/// as returning, in seconds.
+///
+/// A source rotating through addresses uses each one for a moment and never
+/// again; a device asks for as long as it is switched on.
+const RETURNING_AFTER: u32 = 600;
+
+/// How long a returning address may stay silent before it stops counting as
+/// one, in seconds, so the protection goes to devices that are still around.
+const STALE_AFTER: u32 = 86_400;
+
+/// A runtime client and what the eviction order needs to know about it.
+struct Slot {
+    client: RuntimeClient,
+    /// When the address was recorded, on the store's clock.
+    first: u32,
+    /// When it last asked something.  Atomic so the query path can move it
+    /// forward under the read lock.
+    seen: AtomicU32,
+}
+
+/// The table and its count of what may be evicted, behind one lock so the
+/// two cannot disagree.
 #[derive(Default)]
+struct Table {
+    map: AHashMap<IpAddr, Slot>,
+    /// How many entries the network taught, which is what `MAX_RUNTIME`
+    /// bounds and `evict` may give up.
+    learned: usize,
+}
+
+impl Table {
+    /// Gives up learned entries until `keep` are left, the least worth
+    /// keeping first and the least recently seen first among equals.
+    ///
+    /// It walks the whole table, which is why the caller makes room for a
+    /// tenth of the cap at a time: the walk is paid once per thousand new
+    /// addresses rather than once per address, and it is paid by discovery,
+    /// never by a query.
+    fn evict(&mut self, keep: usize, now: u32) {
+        let mut order: Vec<(u8, u32, IpAddr)> = self
+            .map
+            .iter()
+            .filter(|(_, s)| !anchored(&s.client))
+            .map(|(a, s)| {
+                let seen = s.seen.load(Ordering::Relaxed);
+
+                (worth(*a, s.first, seen, now), seen, *a)
+            })
+            .collect();
+        // Counted rather than trusted, so a count that ever drifted is put
+        // right by the next eviction instead of being carried forward.
+        self.learned = order.len();
+
+        let excess = self.learned.saturating_sub(keep);
+        if excess == 0 {
+            return;
+        }
+
+        order.select_nth_unstable(excess - 1);
+        for (_, _, a) in &order[..excess] {
+            self.map.remove(a);
+        }
+        self.learned -= excess;
+    }
+}
+
+/// How much an operator would miss a learned entry, lowest first.
+///
+/// A public address seen once is what a flood is made of and goes first; a
+/// public address that came back is somebody's phone or laptop; a local
+/// address is on the operator's own network, where its reverse name is the
+/// one the router gave it, and outranks both.  A stranger cannot buy that
+/// rank by forging a local source: the reverse lookup of a local address goes
+/// to the local resolvers, which answer only for the operator's own devices,
+/// and WHOIS is never asked about one, so a forged address nobody on the
+/// network holds learns nothing and is never recorded.
+fn worth(addr: IpAddr, first: u32, seen: u32, now: u32) -> u8 {
+    let returning =
+        seen.saturating_sub(first) >= RETURNING_AFTER && now.saturating_sub(seen) < STALE_AFTER;
+
+    2 * u8::from(is_local(addr)) + u8::from(returning)
+}
+
+/// Reports whether this machine rather than the network supplied what is
+/// known: a hosts-file or ARP name, a DHCP lease, or a hardware address.
+const fn anchored(c: &RuntimeClient) -> bool {
+    c.mac.is_some() || matches!(c.source, Some(Source::Hosts | Source::Arp | Source::Dhcp))
+}
+
+/// The store of clients discovered at run time.
+///
+/// Bounded by [`MAX_RUNTIME`]: when the network has taught it that many, the
+/// entries least worth keeping are given up to make room.  An evicted
+/// address that asks again is simply looked up again.
 pub struct Runtime {
     /// What is known, by address.
-    clients: RwLock<HashMap<IpAddr, RuntimeClient>>,
+    table: RwLock<Table>,
     /// Which sources may contribute.
     sources: RwLock<Sources>,
+    /// The most entries the network may add.
+    cap: usize,
+    /// What the store's clock counts from.
+    epoch: Instant,
+    /// Seconds added to the clock, so the tests do not have to wait.
+    #[cfg(test)]
+    skew: AtomicU32,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Runtime {
     /// An empty store.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_cap(MAX_RUNTIME)
+    }
+
+    /// An empty store that holds at most `cap` learned entries.
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            table: RwLock::new(Table::default()),
+            sources: RwLock::new(Sources::default()),
+            cap: cap.max(1),
+            epoch: Instant::now(),
+            #[cfg(test)]
+            skew: AtomicU32::new(0),
+        }
     }
 
     /// Replaces the enabled sources.
@@ -109,12 +254,12 @@ impl Runtime {
             return;
         }
 
-        let mut map = self.clients.write();
-        let e = map.entry(addr).or_default();
-        if e.name.is_empty() || rank(source) >= rank_of(e.source) {
-            e.name = name;
-            e.source = Some(source);
-        }
+        self.update(addr, |e| {
+            if e.name.is_empty() || rank(source) >= rank_of(e.source) {
+                e.name = name;
+                e.source = Some(source);
+            }
+        });
     }
 
     /// Records the hardware address the ARP table reports.
@@ -127,41 +272,91 @@ impl Runtime {
             return;
         }
 
-        self.clients.write().entry(addr).or_default().mac = Some(mac);
+        self.update(addr, |e| e.mac = Some(mac));
     }
 
     /// The hardware address known for an address, if any.
     pub fn mac_of(&self, addr: IpAddr) -> Option<String> {
-        self.clients.read().get(&addr).and_then(|c| c.mac.clone())
+        self.table
+            .read()
+            .map
+            .get(&addr)
+            .and_then(|s| s.client.mac.clone())
     }
 
     /// Records WHOIS fields for an address.
+    ///
+    /// An empty record for an address nothing is known about adds nothing:
+    /// an entry is worth its slot only when it has something to show.
     pub fn set_whois(&self, addr: IpAddr, fields: Vec<(String, String)>) {
-        let mut map = self.clients.write();
-        map.entry(addr).or_default().whois = fields;
+        self.update(addr, |e| e.whois = fields);
+    }
+
+    /// Applies a change to an address's entry, making one if it has none and
+    /// making room if the network has already filled the table.
+    fn update(&self, addr: IpAddr, f: impl FnOnce(&mut RuntimeClient)) {
+        let now = self.now();
+        let mut guard = self.table.write();
+        let t = &mut *guard;
+
+        if let Some(slot) = t.map.get_mut(&addr) {
+            let before = anchored(&slot.client);
+            f(&mut slot.client);
+            match (before, anchored(&slot.client)) {
+                (false, true) => t.learned = t.learned.saturating_sub(1),
+                (true, false) => t.learned += 1,
+                _ => {}
+            }
+
+            return;
+        }
+
+        let mut client = RuntimeClient::default();
+        f(&mut client);
+        if client.name.is_empty() && client.mac.is_none() && client.whois.is_empty() {
+            return;
+        }
+
+        if !anchored(&client) {
+            if t.learned >= self.cap {
+                t.evict(self.cap - (self.cap / 10).max(1), now);
+            }
+            t.learned += 1;
+        }
+
+        t.map.insert(
+            addr,
+            Slot {
+                client,
+                first: now,
+                seen: AtomicU32::new(now),
+            },
+        );
     }
 
     /// Looks an address up.
     pub fn get(&self, addr: IpAddr) -> Option<RuntimeClient> {
-        self.clients.read().get(&addr).cloned()
+        self.table.read().map.get(&addr).map(|s| s.client.clone())
     }
 
     /// The name known for an address, or an empty string.
     pub fn name_of(&self, addr: IpAddr) -> String {
-        self.clients
+        self.table
             .read()
+            .map
             .get(&addr)
-            .map(|c| c.name.clone())
+            .map(|s| s.client.name.clone())
             .unwrap_or_default()
     }
 
     /// Every known client, sorted by address, as the API reports them.
     pub fn all(&self) -> Vec<(IpAddr, RuntimeClient)> {
         let mut v: Vec<(IpAddr, RuntimeClient)> = self
-            .clients
+            .table
             .read()
+            .map
             .iter()
-            .map(|(k, c)| (*k, c.clone()))
+            .map(|(k, s)| (*k, s.client.clone()))
             .collect();
         v.sort_by_key(|(a, _)| *a);
 
@@ -171,30 +366,79 @@ impl Runtime {
     /// Reports whether an address has already been looked at, so a discovery
     /// pass can skip it.
     pub fn is_known(&self, addr: IpAddr) -> bool {
-        self.clients.read().contains_key(&addr)
+        self.table.read().map.contains_key(&addr)
+    }
+
+    /// Notes that an address asked something, and reports whether anything
+    /// is known about it.
+    ///
+    /// This runs for every query, so it takes only the read lock, and it
+    /// writes the time only when the time has moved: a busy client costs one
+    /// store a second rather than one per query.  It is what keeps a device
+    /// that is in use ahead of a flood of addresses that asked once.
+    pub fn touch(&self, addr: IpAddr) -> bool {
+        let t = self.table.read();
+        let Some(slot) = t.map.get(&addr) else {
+            return false;
+        };
+
+        let now = self.now();
+        if slot.seen.load(Ordering::Relaxed) < now {
+            slot.seen.fetch_max(now, Ordering::Relaxed);
+        }
+
+        true
+    }
+
+    /// How many addresses the store holds.
+    pub fn len(&self) -> usize {
+        self.table.read().map.len()
+    }
+
+    /// Reports whether the store holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.table.read().map.is_empty()
     }
 
     /// How many addresses the store holds, and how many of those carry a
     /// WHOIS record.
     ///
-    /// Nothing evicts from here: an address is added the first time it asks
-    /// something and kept for the life of the process, so on a resolver open
-    /// to the internet this grows with the number of distinct sources that
-    /// have ever reached it.  That is upstream's behaviour too, and it is
-    /// bounded by the network on a home installation -- but it is the first
-    /// number to read when a resolver that is exposed keeps growing.
+    /// The first is at most [`MAX_RUNTIME`] plus what the hosts file and the
+    /// ARP table supplied, however many sources have reached the server: a
+    /// count standing at the cap on a resolver open to the internet is
+    /// eviction doing its job, not a leak.
     pub fn sizes(&self) -> (usize, usize) {
-        let map = self.clients.read();
+        let t = self.table.read();
 
         (
-            map.len(),
-            map.values().filter(|c| !c.whois.is_empty()).count(),
+            t.map.len(),
+            t.map
+                .values()
+                .filter(|s| !s.client.whois.is_empty())
+                .count(),
         )
     }
 
     /// Forgets everything.
     pub fn clear(&self) {
-        self.clients.write().clear();
+        let mut t = self.table.write();
+        t.map.clear();
+        t.learned = 0;
+    }
+
+    /// The store's clock, in whole seconds since it was built.
+    fn now(&self) -> u32 {
+        let now = u32::try_from(self.epoch.elapsed().as_secs()).unwrap_or(u32::MAX);
+        #[cfg(test)]
+        let now = now.saturating_add(self.skew.load(Ordering::Relaxed));
+
+        now
+    }
+
+    /// Moves the clock on, so the tests do not have to wait.
+    #[cfg(test)]
+    fn advance(&self, secs: u32) {
+        self.skew.fetch_add(secs, Ordering::Relaxed);
     }
 }
 
@@ -286,6 +530,33 @@ fn is_mac(s: &str) -> bool {
         && parts
             .iter()
             .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// The networks an address is local in: upstream's defaults, the list
+/// [`crate::resolver::default_private_networks`] builds, held as a constant so
+/// the query path can ask without allocating.
+const LOCAL_NETWORKS: [(IpAddr, u8); 9] = [
+    (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
+    (IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), 12),
+    (IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16),
+    (IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), 16),
+    (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8),
+    (IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10),
+    (IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0)), 8),
+    (IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)), 10),
+    (IpAddr::V6(Ipv6Addr::LOCALHOST), 128),
+];
+
+/// Reports whether an address is on a local network.
+///
+/// An IPv4 address carried in IPv6 is judged as the IPv4 address it is, which
+/// is how a dual-stack socket hands one over.
+pub fn is_local(addr: IpAddr) -> bool {
+    let addr = addr.to_canonical();
+
+    LOCAL_NETWORKS
+        .iter()
+        .any(|&(net, bits)| in_subnet(addr, net, bits))
 }
 
 /// Reports whether an address is inside a subnet.
@@ -720,5 +991,253 @@ mod tests {
         assert!(is_mac("AA-BB-CC-DD-EE-FF"));
         assert!(!is_mac("aa:bb:cc:dd:ee"));
         assert!(!is_mac("kids-tablet"));
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// A stranger's address: one per /64, which is what a source rotating
+    /// through a routed /48 has to spend.
+    fn stranger(i: u32) -> IpAddr {
+        let bits = (0x2001_0db8_u128 << 96) | (u128::from(i) << 64) | 1;
+
+        IpAddr::V6(Ipv6Addr::from_bits(bits))
+    }
+
+    /// What WHOIS says about a typical broadband address.
+    fn whois_record() -> Vec<(String, String)> {
+        vec![
+            ("orgname".into(), "Example Broadband Networks Ltd".into()),
+            ("city".into(), "Amsterdam".into()),
+            ("country".into(), "NL".into()),
+        ]
+    }
+
+    #[test]
+    fn the_table_never_holds_more_than_the_cap_whatever_floods_it() {
+        // A hundred thousand sources, each in a /64 of its own, each named by
+        // a reverse lookup and described by WHOIS -- ten times the cap, and
+        // the most expensive entry there is.
+        let r = Runtime::new();
+        let mut most = 0;
+        for i in 0..100_000 {
+            let a = stranger(i);
+            r.set_name(a, format!("host-{i}.dyn.example.net"), Source::Rdns);
+            r.set_whois(a, whois_record());
+            most = most.max(r.len());
+            if i % 100 == 0 {
+                r.advance(1);
+            }
+        }
+
+        assert!(most <= MAX_RUNTIME, "held {most}");
+        assert!(
+            r.len() > MAX_RUNTIME - MAX_RUNTIME / 10,
+            "room is made a batch at a time, not by emptying the table"
+        );
+        assert!(r.is_known(stranger(99_999)), "the newest is kept");
+        assert_eq!(r.sizes().1, r.len(), "every entry kept its record");
+    }
+
+    #[test]
+    fn a_local_client_and_a_busy_one_outlive_a_flood_of_strangers() {
+        let r = Runtime::with_cap(1_000);
+
+        // Seen once and never again, but on the operator's own network.
+        let nas = ip("192.168.1.20");
+        r.set_name(nas, "nas.lan", Source::Rdns);
+        let laptop = ip("fd00::1234");
+        r.set_name(laptop, "laptop.lan", Source::Rdns);
+
+        // A phone on mobile data: it asked, came back ten minutes later, and
+        // then went quiet for the whole of the flood.
+        let phone = ip("203.0.113.7");
+        r.set_name(phone, "phone.mobile.example", Source::Rdns);
+        r.advance(RETURNING_AFTER);
+        assert!(r.touch(phone));
+
+        // A public client that is in use the whole time.
+        let busy = ip("198.51.100.9");
+        r.set_whois(busy, whois_record());
+
+        for i in 0..20_000 {
+            r.set_name(stranger(i), format!("s{i}.example"), Source::Rdns);
+            if i % 10 == 0 {
+                r.advance(1);
+                r.touch(busy);
+            }
+            assert!(r.len() <= 1_000);
+        }
+
+        for (a, what) in [
+            (nas, "a local address"),
+            (laptop, "a local IPv6 address"),
+            (phone, "a client that came back"),
+            (busy, "a client in use"),
+        ] {
+            assert!(r.is_known(a), "{what} was given up for strangers");
+        }
+    }
+
+    #[test]
+    fn what_this_machine_supplied_is_never_given_up() {
+        // A persistent client identified by its hardware address is only
+        // recognised while the ARP table's MAC stays in the runtime store, so
+        // evicting it would quietly drop the operator's settings for it.
+        let registry = Registry::build(&[spec("kids-tablet", &["aa:bb:cc:dd:ee:ff"])]);
+        let r = Runtime::with_cap(100);
+
+        let tablet = ip("192.0.2.50");
+        r.set_mac(tablet, "AA:BB:CC:DD:EE:FF");
+        for i in 0..150 {
+            r.set_name(
+                IpAddr::V4(Ipv4Addr::new(198, 18, 0, i)),
+                format!("h{i}"),
+                Source::Hosts,
+            );
+        }
+
+        for i in 0..5_000 {
+            r.set_name(stranger(i), "s.example", Source::Rdns);
+        }
+
+        assert_eq!(r.mac_of(tablet).as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert!(
+            registry
+                .find(Some(tablet), None, r.mac_of(tablet).as_deref())
+                .is_some(),
+            "the persistent client is still recognised"
+        );
+        assert_eq!(r.name_of(ip("198.18.0.149")), "h149");
+        assert!(
+            r.len() <= 151 + 100,
+            "the cap binds what the network taught, beside what the machine did"
+        );
+    }
+
+    #[test]
+    fn a_learned_entry_the_arp_table_names_stops_counting_against_the_cap() {
+        let r = Runtime::with_cap(10);
+        let printer = ip("192.0.2.9");
+        r.set_name(printer, "printer.rdns.example", Source::Rdns);
+        r.set_mac(printer, "aa:bb:cc:00:00:01");
+
+        for i in 0..100 {
+            r.set_name(stranger(i), "s.example", Source::Rdns);
+        }
+
+        assert!(r.is_known(printer));
+        assert!(r.len() <= 11);
+    }
+
+    #[test]
+    fn the_least_recently_seen_stranger_goes_first() {
+        let r = Runtime::with_cap(10);
+        for i in 0..10 {
+            r.set_name(stranger(i), "s.example", Source::Rdns);
+            r.advance(1);
+        }
+        // The first one asks again, so the second is now the oldest.
+        assert!(r.touch(stranger(0)));
+
+        r.set_name(stranger(10), "s.example", Source::Rdns);
+
+        assert!(r.is_known(stranger(0)), "seen a moment ago");
+        assert!(!r.is_known(stranger(1)), "the least recently seen");
+        assert!(r.is_known(stranger(10)), "the newcomer");
+        assert_eq!(r.len(), 10);
+    }
+
+    #[test]
+    fn a_client_gone_a_day_is_no_longer_protected() {
+        let r = Runtime::with_cap(10);
+        let gone = ip("203.0.113.7");
+        r.set_name(gone, "old-phone.example", Source::Rdns);
+        r.advance(RETURNING_AFTER);
+        r.touch(gone);
+        r.advance(STALE_AFTER);
+
+        for i in 0..10 {
+            r.set_name(stranger(i), "s.example", Source::Rdns);
+        }
+
+        assert!(
+            !r.is_known(gone),
+            "a device silent for a day ranks with the strangers, and is the oldest of them"
+        );
+    }
+
+    #[test]
+    fn a_learned_entry_is_refused_nothing_when_the_machine_filled_the_table() {
+        // The hosts file does not count against the cap, so however large it
+        // is there is still room for the network's own entries.
+        let r = Runtime::with_cap(10);
+        for i in 0..50 {
+            r.set_name(IpAddr::V4(Ipv4Addr::new(198, 18, 0, i)), "h", Source::Hosts);
+        }
+        r.set_name(stranger(0), "s.example", Source::Rdns);
+
+        assert!(r.is_known(stranger(0)));
+    }
+
+    #[test]
+    fn touching_an_unknown_address_records_nothing() {
+        let r = Runtime::new();
+        assert!(!r.touch(ip("192.0.2.1")));
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn an_empty_whois_record_for_an_unknown_address_adds_nothing() {
+        let r = Runtime::new();
+        let a = ip("203.0.113.1");
+        r.set_whois(a, Vec::new());
+        assert!(!r.is_known(a));
+
+        r.set_whois(a, whois_record());
+        assert_eq!(r.sizes(), (1, 1));
+    }
+
+    #[test]
+    fn clearing_the_store_resets_the_cap() {
+        let r = Runtime::with_cap(10);
+        for i in 0..10 {
+            r.set_name(stranger(i), "s.example", Source::Rdns);
+        }
+        r.clear();
+        for i in 10..20 {
+            r.set_name(stranger(i), "s.example", Source::Rdns);
+        }
+
+        assert_eq!(r.len(), 10, "nothing was evicted to make room");
+    }
+
+    #[test]
+    fn an_entry_stays_small() {
+        // The table is sized for ten thousand of these; see `MAX_RUNTIME`.
+        let slot = std::mem::size_of::<(IpAddr, Slot)>();
+        assert!(slot <= 112, "{slot} bytes");
+    }
+
+    #[test]
+    fn local_networks_are_the_resolvers_defaults() {
+        assert_eq!(
+            LOCAL_NETWORKS.to_vec(),
+            crate::resolver::default_private_networks()
+        );
+    }
+
+    #[test]
+    fn local_addresses_are_recognised() {
+        assert!(is_local(ip("192.168.1.1")));
+        assert!(is_local(ip("10.1.2.3")));
+        assert!(is_local(ip("fd00::1")));
+        assert!(
+            is_local(ip("::ffff:192.168.1.1")),
+            "an IPv4 address in IPv6"
+        );
+        assert!(!is_local(ip("93.184.216.34")));
+        assert!(!is_local(ip("2001:db8::1")));
     }
 }

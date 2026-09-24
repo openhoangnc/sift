@@ -57,7 +57,7 @@ installation.
 ```bash
 cargo build --release            # fast to build and to run
 cargo build --profile dist       # fat LTO, panic=abort, stripped: ~10.7 MB
-cargo test --workspace           # 788 tests, no network or Go build needed
+cargo test --workspace           # 1,064 tests, no network or Go build needed
 cargo clippy --workspace --all-targets
 ```
 
@@ -307,7 +307,38 @@ toggles, its own blocked services and its own safe search.
   `ratelimit_diff.py` guards why: a NAT with a hundred clients behind it is
   busy and legitimate, and the last build that limited streams by rate cut
   every one of them off. It runs before the TLS handshake, because the
-  handshake is the cost being avoided.
+  handshake is the cost being avoided. What it *does* bound is what is held
+  at once — connections per source and in all, handshakes in progress — and
+  reaching a limit is never a strike. An IPv6 source is its /64.
+- **What counts as "asking something" is a defence, so it is narrow.** The
+  guard forgives a source for one answered query, which makes that the thing
+  a scanner has to fake. `Server::answer` says whether an answer `counts`:
+  an access-list refusal, a `blocked_hosts` REFUSED (`version.bind` is what
+  scanners ask), FORMERR and NOTIMP do not. On the HTTPS port a request
+  counts only below 400 and without the `doh::Unanswered` response
+  extension. A new answer path that forgets either lets scanners clear
+  themselves.
+- **A condemned connection is never reported as served.** `Guard::served`
+  clears a source's strikes and offences — though never a penalty it is
+  serving — and a scanner fetches `/` before `/.env`. The tripwire in
+  `sift-api/src/shield.rs` reports the whole connection, and any other one
+  closing while its source is banned, as having asked nothing; a kept-alive
+  connection can outlast its penalty, which is why the check at close stays.
+- **Busy is neither asking nor not asking.** `Answer::busy` marks a SERVFAIL
+  the server gave because a limit was reached, and DoH carries it as the
+  `doh::Overloaded` extension. A connection whose answers were only busy is
+  recorded with the guard not at all: otherwise a flood of slow lookups gets
+  every legitimate client struck, and the flood's own sources, answered by
+  the upstream, are not. Likewise a connection closed within a second without
+  a byte — a port monitor — records nothing. The tripwire
+  lives in the encrypted listeners' service wrappers rather than the shared
+  router, and a test runs it over every embedded asset and every route, so a
+  new route cannot trip it.
+- **Every accept loop survives its errors.** One `EMFILE` used to end the DoT
+  and TCP listeners for good through a `?`. They share
+  `sift_dns::server::AcceptErrors`, which passes over an error about one
+  connection and waits out anything else. Do not reintroduce a `?` on
+  `accept`.
 - **A protection pause is a deadline, not a timer.**
   `filtering.protection_disabled_until` holds the moment protection comes
   back, so the pause means the same thing across a restart, and

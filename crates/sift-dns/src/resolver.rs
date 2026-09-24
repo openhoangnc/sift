@@ -210,6 +210,15 @@ pub struct Outcome {
     pub ignore_querylog: bool,
     /// Whether the client is excluded from the statistics.
     pub ignore_statistics: bool,
+    /// Whether the question was refused by `dns.blocked_hosts`.
+    ///
+    /// Set on that one path and nowhere else, because what a listener makes
+    /// of the answer depends on it: the default list is `version.bind`,
+    /// `id.server` and `hostname.bind`, which is what a scanner asks and a
+    /// client of this server never does, so being refused one is not being
+    /// served.  A query refused by a filtering rule under `blocking_mode:
+    /// refused` looks the same on the wire and is an ordinary answer.
+    pub blocked_host: bool,
 }
 
 impl Default for Outcome {
@@ -228,6 +237,7 @@ impl Default for Outcome {
             service_name: String::new(),
             ignore_querylog: false,
             ignore_statistics: false,
+            blocked_host: false,
         }
     }
 }
@@ -592,6 +602,7 @@ impl Resolver {
             return finish(Outcome {
                 action,
                 reason: Reason::FilteredBlockList,
+                blocked_host: true,
                 ..base()
             });
         }
@@ -1265,6 +1276,28 @@ mod tests {
             out.response().unwrap().metadata.response_code,
             ResponseCode::Refused
         );
+        assert!(out.blocked_host, "and says why, for the listener");
+    }
+
+    #[tokio::test]
+    async fn only_blocked_hosts_mark_a_refusal_as_theirs() {
+        // A filtering rule under `blocking_mode: refused` sends the same
+        // rcode, and is an answer to a client like any other.
+        let settings = Settings {
+            blocking: crate::msg::BlockingConfig {
+                mode: crate::msg::BlockingMode::Refused,
+                ..Default::default()
+            },
+            ..Settings::default()
+        };
+        let r = resolver("||ads.example.com^\n", Table::default(), settings);
+
+        let out = resolve(&r, "ads.example.com.", RecordType::A, Proto::Tcp).await;
+        assert_eq!(
+            out.response().unwrap().metadata.response_code,
+            ResponseCode::Refused
+        );
+        assert!(!out.blocked_host);
     }
 
     #[tokio::test]

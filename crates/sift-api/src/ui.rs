@@ -11,6 +11,22 @@
 //! bytes.  That would be expensive per request, which is why the caching below
 //! matters: a client pays for an asset once per build, not once per page load.
 //!
+//! # Memory
+//!
+//! No response copies an asset.  The stored bytes are `'static` and served as
+//! they are, and each asset is decompressed **at most once** for the life of
+//! the process, the first time a client without brotli asks for it, into a
+//! buffer every later response shares.  Decompressing per request made the
+//! public login script (60 KB stored, 226 KB plain) a lever: one HTTP/2
+//! connection opening 200 streams without brotli, and never granting a byte
+//! of flow-control window, pinned 45 MB for a few kilobytes sent and no
+//! session.  Those 200 responses are now 200 reference counts on one buffer.
+//!
+//! What that costs is the plain form of whatever has been asked for, once:
+//! 1.38 MB if every asset of the current build is, and about 245 KB for
+//! everything a signed-out visitor can reach -- the login page, its script
+//! and stylesheet, and the icons.
+//!
 //! # Caching
 //!
 //! The build names every script and stylesheet after a hash of its contents
@@ -22,9 +38,14 @@
 //! it is the stored file's SHA-256, which rust-embed computes at build time,
 //! and `If-None-Match` is answered without touching the body.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::{LazyLock, OnceLock};
+
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 use rust_embed::RustEmbed;
 
 /// The built web interface.
@@ -108,7 +129,7 @@ fn lookup(name: &str, headers: &HeaderMap) -> Option<Response> {
                         (header::CACHE_CONTROL, caching),
                         (header::ETAG, etag.as_str()),
                     ],
-                    Body::from(f.data.into_owned()),
+                    Body::from(shared(f.data)),
                 )
                     .into_response(),
             );
@@ -121,7 +142,7 @@ fn lookup(name: &str, headers: &HeaderMap) -> Option<Response> {
             return Some(not_modified(&etag, caching));
         }
 
-        let plain = decompress(&f.data)?;
+        let plain = plain(name, &hash, &f.data)?;
 
         return Some(
             (
@@ -151,10 +172,71 @@ fn lookup(name: &str, headers: &HeaderMap) -> Option<Response> {
                 (header::CACHE_CONTROL, caching),
                 (header::ETAG, etag.as_str()),
             ],
-            Body::from(f.data.into_owned()),
+            Body::from(shared(f.data)),
         )
             .into_response(),
     )
+}
+
+/// The stored bytes of an asset, as a body that does not copy them.
+///
+/// A release build embeds every asset, so this is a `'static` slice and the
+/// body only points at it.  A debug build reads the file afresh on each
+/// lookup, which is rust-embed's development convenience, and the owned bytes
+/// it hands back are moved rather than copied.
+fn shared(data: Cow<'static, [u8]>) -> Bytes {
+    match data {
+        Cow::Borrowed(b) => Bytes::from_static(b),
+        Cow::Owned(v) => Bytes::from(v),
+    }
+}
+
+/// An asset's plain form, as it was when it was decompressed.
+struct Plain {
+    /// The stored file's hash, which says which build these bytes are of.
+    hash: [u8; 32],
+    /// The decompressed bytes, or `None` if the stored ones did not
+    /// decompress -- remembered too, so a broken asset is not retried on
+    /// every request.
+    bytes: Option<Bytes>,
+}
+
+/// One slot per compressed asset, each filled the first time it is needed.
+///
+/// Built from the build's own list of files, so it holds exactly the assets
+/// there are: a request for anything else never reaches it, and nothing a
+/// client sends can add a slot.
+static PLAIN: LazyLock<HashMap<String, OnceLock<Plain>>> = LazyLock::new(|| {
+    Assets::iter()
+        .filter_map(|p| {
+            p.strip_suffix(STORED_EXT)
+                .and_then(|n| n.strip_suffix('.'))
+                .map(|name| (name.to_string(), OnceLock::new()))
+        })
+        .collect()
+});
+
+/// The decompressed form of a stored asset, decompressed at most once.
+///
+/// Every response after the first shares the same buffer, so a client that
+/// cannot take brotli costs a reference count rather than a copy.  The hash
+/// check only matters to a debug build, which reads the files from disk and
+/// so can see a rebuilt interface under a running server: bytes cached from
+/// the old build are never served under the new build's validator.
+fn plain(name: &str, hash: &[u8; 32], stored: &[u8]) -> Option<Bytes> {
+    let Some(slot) = PLAIN.get(name) else {
+        return decompress(stored).map(Bytes::from);
+    };
+
+    let cached = slot.get_or_init(|| Plain {
+        hash: *hash,
+        bytes: decompress(stored).map(Bytes::from),
+    });
+    if cached.hash != *hash {
+        return decompress(stored).map(Bytes::from);
+    }
+
+    cached.bytes.clone()
 }
 
 /// Reports whether the client will take brotli.
@@ -529,6 +611,80 @@ mod tests {
 
         let again = serve("/assets/favicon.png", &revalidating(&tag, true));
         assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    /// The login bundle this build emitted: public, and the largest thing a
+    /// signed-out visitor can ask for.
+    fn login_script() -> String {
+        Assets::iter()
+            .map(|p| p.to_string())
+            .find(|p| p.starts_with("static/login.") && p.ends_with(".js.br"))
+            .expect("a hashed login bundle is embedded")
+            .trim_end_matches(".br")
+            .to_string()
+    }
+
+    async fn body_of(r: Response) -> Bytes {
+        axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .expect("an asset body is in memory")
+    }
+
+    #[tokio::test]
+    async fn a_client_without_brotli_shares_one_decompressed_copy() {
+        // Decompressing per request was a lever: 200 streams asking for the
+        // public login script without brotli, on a connection that never
+        // grants flow-control window, pinned 45 MB for a few kilobytes sent.
+        // Two responses pointing at the same buffer is the proof that the
+        // second one cost a reference count rather than a decompression.
+        let path = format!("/{}", login_script());
+
+        let first = serve(&path, &gzip_headers());
+        let second = serve(&path, &gzip_headers());
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(first.headers().get(header::CONTENT_ENCODING).is_none());
+
+        let tag = header_of(&first, header::ETAG);
+        assert!(tag.ends_with("-identity\""), "{tag}");
+        assert_eq!(header_of(&second, header::ETAG), tag);
+        assert_eq!(header_of(&first, header::CACHE_CONTROL), IMMUTABLE);
+
+        let a = body_of(first).await;
+        let b = body_of(second).await;
+        assert_eq!(a.as_ptr(), b.as_ptr(), "both responses share one buffer");
+
+        let stored = Assets::get(&format!("{}.br", login_script())).unwrap();
+        assert_eq!(
+            a,
+            decompress(&stored.data).unwrap(),
+            "and it is the plain form of the stored bytes"
+        );
+
+        // The compressed representation keeps its own validator and is the
+        // stored bytes themselves, untouched.
+        let br = serve(&path, &brotli_headers());
+        let br_tag = header_of(&br, header::ETAG);
+        assert!(br_tag.ends_with("-br\""), "{br_tag}");
+        assert_ne!(br_tag, tag);
+        let body = body_of(br).await;
+        assert_eq!(body, stored.data.as_ref());
+
+        // Where the bytes are embedded -- every build but a debug one, which
+        // reads them from disk -- the body is the embedded bytes themselves.
+        if let Cow::Borrowed(embedded) = stored.data {
+            assert_eq!(body.as_ptr(), embedded.as_ptr(), "not a copy");
+        }
+    }
+
+    #[test]
+    fn only_assets_the_build_emitted_have_a_slot_to_fill() {
+        // The cache is sized by the build, not by what clients ask for: a
+        // slot per compressed asset, made before any request arrives.
+        let compressed = Assets::iter().filter(|p| p.ends_with(".br")).count();
+        assert_eq!(PLAIN.len(), compressed);
+        assert!(PLAIN.contains_key("index.html"));
+        assert!(!PLAIN.contains_key("index.html.br"));
+        assert!(!PLAIN.contains_key("assets/favicon.png"), "stored plain");
     }
 
     #[test]
