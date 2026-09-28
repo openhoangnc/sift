@@ -1,16 +1,33 @@
 name: Docker
 
-# The only workflow that runs on its own. It builds the image for amd64 and
-# arm64 on native runners, publishes one multi-architecture tag to GHCR, and
-# then prunes the package back to the newest three releases.
+# The only workflow, and it runs on request only: a push to main whose commit
+# message carries `[deploy]`, or a manual run. Pushing a tag does not start a
+# build.
 #
-# The full test, lint and differential suite lives in ci.yml and is run by
-# hand; `cargo test --workspace` covers it locally without a network.
+# Every run builds the image for amd64 and arm64 on native runners, publishes
+# one multi-architecture tag to GHCR, and then prunes the package back to the
+# newest three releases.
+#
+# Run on a release tag, it also builds the installer's archives and attaches
+# them to the GitHub release for that tag:
+#
+#     git tag -a v1.2.3 -m "…" && git push origin v1.2.3
+#     gh workflow run docker.yml --ref v1.2.3
+#
+# The archives are what `scripts/install.sh` and the self-updater fetch, so
+# their names and the layout inside them are a contract: `sift_<os>_<cpu>.tar.gz`,
+# holding `AdGuardHome/AdGuardHome` — AdGuard Home's own package layout, which
+# is what lets an existing installation be upgraded in place.
+# `scripts/package.sh` builds them, here and by hand alike. Every Linux build
+# is statically linked against musl, so one archive per architecture runs on
+# any distribution, however old its glibc.
+#
+# There is no CI workflow: the test, lint and differential suite runs locally —
+# `cargo test --workspace`, `scripts/build-frontend.sh` and `scripts/verify.sh`.
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
     # A documentation-only commit does not change the image, and the build is
     # two full LTO compiles of the workspace.
     paths-ignore:
@@ -19,15 +36,17 @@ on:
   workflow_dispatch:
 
 env:
+  CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   # How many published releases to keep in the registry.
   KEEP_RELEASES: '3'
 
-# A newer push makes an in-flight build pointless; stop paying for it.
+# A newer push makes an in-flight build pointless; stop paying for it. A
+# release is never cancelled halfway through attaching its archives.
 concurrency:
   group: docker-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 permissions:
   contents: read
@@ -36,6 +55,11 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.platform }}
+    # Opt-in: a push runs only when one of its commit messages carries `[deploy]`.
+    # A skipped job allocates no runner and bills nothing. Manual runs always go.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || contains(join(github.event.commits.*.message), '[deploy]')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -241,3 +265,168 @@ jobs:
           package-type: container
           package-version-ids: ${{ steps.plan.outputs.ids }}
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---- Release archives: only when run on a `v*` tag -------------------------
+  #
+  # A tag is the one moment the suite is worth paying for on a clean machine:
+  # there is no CI workflow, and a release nobody can un-publish should not be
+  # the first place a red test is noticed. A push is always to a branch, so
+  # none of these can start without a manual run.
+  test:
+    name: Tests
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo test --workspace --locked
+
+  archives:
+    name: ${{ matrix.os }}_${{ matrix.cpu }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # A leg that fails should not take the others down with it: the failure
+      # is easier to read next to four archives that did build.
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            cpu: amd64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - os: linux
+            cpu: arm64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          # The only leg that is not built on its own architecture.  There is
+          # no 32-bit Arm runner, and no musl cross toolchain in apt, so this
+          # one goes through cross's container images.
+          - os: linux
+            cpu: armv7
+            target: armv7-unknown-linux-musleabihf
+            runner: ubuntu-latest
+            cross: true
+          - os: darwin
+            cpu: amd64
+            target: x86_64-apple-darwin
+            runner: macos-latest
+          - os: darwin
+            cpu: arm64
+            target: aarch64-apple-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain
+        run: |
+          # Naming no toolchain installs the one rust-toolchain.toml pins,
+          # rather than whatever the runner happens to ship.
+          rustup show
+          rustup target add '${{ matrix.target }}'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # ring, the rustls crypto provider, needs a C compiler for the target.
+      # cc-rs looks for musl-gcc on a musl target, which is what this package
+      # provides for the architecture it is installed on.
+      - name: musl toolchain
+        if: matrix.os == 'linux' && !matrix.cross
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: cross
+        if: matrix.cross
+        run: cargo install cross --locked --version 0.2.5
+
+      - name: Build
+        run: |
+          set -eu
+          if [ '${{ matrix.cross }}' = 'true' ]; then
+            cross build --locked --profile dist --bin AdGuardHome --target '${{ matrix.target }}'
+          else
+            cargo build --locked --profile dist --bin AdGuardHome --target '${{ matrix.target }}'
+          fi
+
+      - name: Package
+        run: |
+          scripts/package.sh \
+            'target/${{ matrix.target }}/dist/AdGuardHome' \
+            '${{ matrix.os }}' \
+            '${{ matrix.cpu }}' \
+            dist
+
+      # A binary for the machine this runs on is worth starting once: a
+      # missing symbol or a bad crypto provider fails here rather than on
+      # somebody's DNS server.
+      - name: It runs
+        if: |
+          (matrix.cpu == 'amd64' && matrix.os == 'linux' && runner.arch == 'X64')
+          || (matrix.cpu == 'arm64' && matrix.os == 'linux' && runner.arch == 'ARM64')
+          || (matrix.cpu == 'arm64' && matrix.os == 'darwin')
+        run: |
+          set -eu
+          'target/${{ matrix.target }}/dist/AdGuardHome' --version
+          'target/${{ matrix.target }}/dist/AdGuardHome' --version | grep -q '^Sift, version v'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sift_${{ matrix.os }}_${{ matrix.cpu }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Attach to the release
+    needs: archives
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: sift_*
+          merge-multiple: true
+
+      - name: Checksums and version
+        id: meta
+        run: |
+          set -eu
+          tag='${{ github.ref_name }}'
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          cd dist
+          ls -l
+          sha256sum sift_*.tar.gz > checksums.txt
+          cat checksums.txt
+
+          # The installer reads this to learn what the newest release is: one
+          # unauthenticated GET of a fixed URL, rather than the API, which
+          # rate-limits by address and would refuse a whole household behind
+          # one of them.
+          printf '%s\n' "$tag" > version.txt
+
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -eu
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --generate-notes --title "Sift $TAG"
+          fi
+
+          gh release upload "$TAG" --clobber \
+            dist/sift_*.tar.gz dist/checksums.txt dist/version.txt
+
+          gh release view "$TAG" --json assets \
+            --jq '.assets[] | "\(.name)\t\(.size)"'

@@ -478,19 +478,21 @@ honoured by the other.
 
 ## Continuous integration
 
-One workflow runs on its own. `.github/workflows/docker.yml` builds the image
-for both architectures on native runners — no emulation — publishes a single
+Nothing runs on its own. `.github/workflows/docker.yml` runs on a push to
+`main` whose commit message carries `[deploy]`, or by hand (`gh workflow run
+docker.yml`, or `--ref v1.2.3` on a release tag). It builds the image for both
+architectures on native runners — no emulation — publishes a single
 multi-architecture tag to GHCR, and then prunes the package back to the newest
 three releases. Documentation-only commits are skipped, and a newer push
 cancels an in-flight build.
 
-`.github/workflows/release.yml` builds the installer's archives for every
-published architecture and attaches them to a `v*` tag.
+Run on a `v*` tag (`gh workflow run docker.yml --ref v1.2.3`), the same
+workflow also builds the installer's archives for every published architecture
+and attaches them to that tag's GitHub release.
 
-`.github/workflows/ci.yml` — formatting, lints, the test suite, and the
-differential against a freshly cloned AdGuard Home — is `workflow_dispatch`
-only. It costs nothing until it is started from the Actions tab, because all of
-it also runs locally: `cargo test --workspace` and `scripts/verify.sh`.
+There is no CI workflow. Formatting, lints, the test suite, and the
+differential against a freshly cloned AdGuard Home run locally: `cargo test
+--workspace` and `scripts/verify.sh`.
 
 ## Licence
 
