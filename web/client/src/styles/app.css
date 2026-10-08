@@ -533,7 +533,7 @@ input:disabled,
 select:disabled,
 textarea:disabled {
     color: var(--text-faint);
-    background: var(--surface-3);
+    background-color: var(--surface-3);
 }
 
 textarea {
@@ -544,8 +544,34 @@ textarea {
     resize: vertical;
 }
 
+/*
+ * The native arrow is drawn flush against the right border and ignores
+ * padding, so every select looked broken: the chevron jammed into the edge,
+ * and on a wide control nowhere near the text.  It is drawn here instead, two
+ * gradients in the theme's colour, with a gutter of its own.  The background
+ * is set by its longhands so `select:disabled`, which changes only the colour,
+ * cannot wipe the chevron with a `background` shorthand.  Do not go back to
+ * the native arrow.
+ */
 select {
+    appearance: none;
+    -webkit-appearance: none;
+    padding-right: 32px;
     cursor: pointer;
+    background-image:
+        linear-gradient(45deg, transparent 50%, var(--text-muted) 50%),
+        linear-gradient(135deg, var(--text-muted) 50%, transparent 50%);
+    background-position:
+        calc(100% - 17px) 50%,
+        calc(100% - 12px) 50%;
+    background-size: 5px 5px;
+    background-repeat: no-repeat;
+}
+
+select[multiple],
+select[size]:not([size='1']) {
+    padding-right: 10px;
+    background-image: none;
 }
 
 .inline-field {
