@@ -1464,6 +1464,28 @@ mod tests {
     }
 
     #[test]
+    fn a_left_anchored_exception_unblocks_one_host_and_nothing_else() {
+        // The query log's "allow this domain only" writes this form, and
+        // promises it leaves the rest of the blocked domain blocked.
+        let e = engine("||hubspotlinks.com^\n@@|d2.na1.hubspotlinks.com^\n");
+        assert_eq!(
+            matches(&e, "d2.na1.hubspotlinks.com").reason,
+            Reason::NotFilteredAllowList
+        );
+        for blocked in [
+            "x.d2.na1.hubspotlinks.com",
+            "d3.na1.hubspotlinks.com",
+            "hubspotlinks.com",
+        ] {
+            assert_eq!(
+                matches(&e, blocked).reason,
+                Reason::FilteredBlockList,
+                "{blocked}"
+            );
+        }
+    }
+
+    #[test]
     fn wildcard_text_rules_match() {
         let e = engine("||ad*.example.com^\n");
         assert_eq!(

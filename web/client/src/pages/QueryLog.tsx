@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 
 import * as api from '../api';
-import type { FilterReason, LogEntry } from '../api';
+import type { Filter, FilterReason, LogEntry } from '../api';
+import { RESERVED, UnblockActions, isBlocked, listNamer } from '../app/Unblock';
 import { Loading, Modal, Notice, useToast } from '../components/ui';
 import { IconRefresh, IconSearch } from '../components/icons';
 import { formatTime } from '../lib/format';
@@ -20,19 +21,6 @@ const STATUSES = [
     { value: 'rewritten', label: 'Rewritten' },
     { value: 'safe_search', label: 'Safe search' },
 ];
-
-/**
- * The lists that have no entry under Filters, by the identifier the resolver
- * records against a rule.  These are upstream's `rulelist.APIID` values.
- */
-const RESERVED: Record<number, string> = {
-    0: 'Custom rules',
-    [-1]: 'System hosts file',
-    [-2]: 'Blocked services',
-    // Neither is produced any more; a log written by AdGuard Home has them.
-    [-3]: 'Parental control',
-    [-4]: 'Safe browsing',
-};
 
 /** How a verdict reads, and the colour it is shown in. */
 function verdict(reason: FilterReason): { text: string; tone: string } {
@@ -74,14 +62,7 @@ export default function QueryLog() {
     // A failure here leaves both falling back to the identifier, which is
     // worse than a name but better than an empty log page.
     const lists = useAsync(() => api.getFilteringStatus());
-    const listName = useCallback(
-        (id: number) => {
-            const all = [...(lists.data?.filters ?? []), ...(lists.data?.whitelist_filters ?? [])];
-
-            return RESERVED[id] ?? all.find((f) => f.id === id)?.name ?? `List ${id}`;
-        },
-        [lists.data],
-    );
+    const listName = useMemo(() => listNamer(lists.data), [lists.data]);
 
     const [term, setTerm] = useState(search);
     const [rows, setRows] = useState<LogEntry[]>([]);
@@ -344,7 +325,18 @@ export default function QueryLog() {
                 <div ref={sentinel} style={{ height: 1 }} />
             </div>
 
-            {detail && <Details entry={detail} listName={listName} onClose={() => setDetail(undefined)} />}
+            {detail && (
+                <Details
+                    entry={detail}
+                    listName={listName}
+                    blocklists={lists.data?.filters ?? []}
+                    onDone={() => {
+                        setDetail(undefined);
+                        void lists.reload();
+                    }}
+                    onClose={() => setDetail(undefined)}
+                />
+            )}
         </>
     );
 }
@@ -395,10 +387,14 @@ function Row({ entry, onOpen, onRule }: { entry: LogEntry; onOpen: () => void; o
 function Details({
     entry,
     listName,
+    blocklists,
+    onDone,
     onClose,
 }: {
     entry: LogEntry;
     listName: (id: number) => string;
+    blocklists: Filter[];
+    onDone: () => void;
     onClose: () => void;
 }) {
     const { text } = verdict(entry.reason);
@@ -416,7 +412,20 @@ function Details({
     ];
 
     return (
-        <Modal title="Query details" onClose={onClose} wide>
+        <Modal
+            title="Query details"
+            onClose={onClose}
+            wide
+            footer={
+                isBlocked(entry) ? (
+                    <>
+                        <span className="muted" style={{ marginRight: 'auto' }}>
+                            Unblock
+                        </span>
+                        <UnblockActions entry={entry} blocklists={blocklists} onDone={onDone} />
+                    </>
+                ) : undefined
+            }>
             <table>
                 <tbody>
                     {rows.map(([k, v]) => (
@@ -457,3 +466,4 @@ function Details({
         </Modal>
     );
 }
+

@@ -303,6 +303,32 @@ Verification claims below are reproducible with `scripts/verify.sh` and
       the hosts file. Reserved identifiers are named from `rulelist.APIID`;
       anything else falls back to `List <id>`, so a rule from a list that has
       since been removed still reads
+- [x] **A block can be undone from where it was found.** The details of a
+      blocked query offer, narrowest first: an exception for that name alone
+      (`@@|name^`), one for the domain it belongs to (`@@||root^`), removing
+      the custom rule that matched, or turning off the list that matched.
+      Each exception takes `$important` when the matching rule had it, or it
+      would lose. The root domain is a heuristic — two labels, three under a
+      ccTLD's `co`/`com`/`org`-style second level — rather than the public
+      suffix list, and the button names the domain it will allow. That
+      `|name^` lets the name through and not its subdomains or siblings is
+      a test in `sift-filter`, checked against the running resolver with
+      `check_host`; it was not compared against a Go build
+- [x] **"Unblock" in the top bar, on every page**, for "something just broke":
+      the names blocked most recently — the last 2,000 blocked entries, one
+      line per name, newest first — narrowed to one device (remembered per
+      browser) or a fragment of the name, each opening the same actions in
+      place. A name an existing custom exception already covers reads
+      *Allowed*. Below the list, the browser's own DNS cache page for
+      Chrome, Edge or Firefox, offered to copy: a page cannot link to
+      `chrome://` addresses, and a browser holds a blocked answer for a while
+      on its own account. `Modal` now renders into `body`, because the top
+      bar's `backdrop-filter` confined a modal opened from it to the bar
+- [x] **Public upstreams can be added from a list.** Under the upstream
+      servers, a picker of six providers' published variants — Cloudflare,
+      Google, Quad9, AdGuard DNS, Mullvad, OpenDNS, unfiltered first — over
+      HTTPS, TLS or QUIC where the provider runs it. It appends to the
+      unsaved list; nothing is applied until **Apply**
 - [x] **Protection can be paused for a set time**, and the pause actually
       ends: 30 seconds, a minute, ten minutes, an hour, or until tomorrow.
       Stored as a deadline in `filtering.protection_disabled_until`, so it

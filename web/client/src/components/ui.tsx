@@ -10,6 +10,7 @@ import {
     useState,
 } from 'react';
 import type { ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 
 import { IconClose } from './icons';
 
@@ -153,6 +154,12 @@ export function Switch({
 
 /* ---------- Modal ---------- */
 
+/**
+ * A dialog over the whole page.  It is rendered into `body` rather than where
+ * it is used: the top bar's `backdrop-filter` makes it the containing block
+ * for anything fixed inside it, and a modal opened from there was confined to
+ * the bar's 80 pixels.
+ */
 export function Modal({
     title,
     onClose,
@@ -183,7 +190,7 @@ export function Modal({
         };
     }, [onClose]);
 
-    return (
+    return createPortal(
         <div
             className="modal-backdrop"
             onMouseDown={(e) => {
@@ -201,7 +208,8 @@ export function Modal({
                 <div className="modal-body">{children}</div>
                 {footer && <div className="modal-foot">{footer}</div>}
             </div>
-        </div>
+        </div>,
+        document.body,
     );
 }
 

@@ -794,6 +794,47 @@ td.actions {
     text-align: center;
 }
 
+/* ---------- Recently blocked ---------- */
+
+/* One line per blocked name in the top bar's panel; a row opens in place to
+   show the ways out, so the list never loses the reader's position. */
+.blocked-item {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    border-radius: 6px;
+}
+
+.blocked-item.open {
+    background: var(--surface-2);
+}
+
+.blocked-head {
+    display: flex;
+    gap: 12px;
+    align-items: baseline;
+    justify-content: space-between;
+    width: 100%;
+    min-width: 0;
+    padding: 0;
+    font: inherit;
+    color: var(--accent);
+    text-align: left;
+    cursor: pointer;
+    background: none;
+    border: none;
+}
+
+.blocked-head:disabled {
+    color: var(--text-muted);
+    cursor: default;
+}
+
+.blocked-head > .muted,
+.blocked-head > .badge {
+    flex: none;
+    font-size: 12px;
+}
+
 /* ---------- Badges and pills ---------- */
 
 .badge {

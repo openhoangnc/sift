@@ -7,6 +7,7 @@ import { IconChevron, IconMenu, IconMoon, IconRefresh, IconSun, IconUser } from 
 import { countdown } from '../lib/format';
 import { message } from '../lib/hooks';
 import { useServer } from './context';
+import { QuickUnblock } from './Unblock';
 
 /**
  * How long protection may be turned off for.
@@ -242,6 +243,8 @@ export default function Topbar({ onBurger }: { onBurger: () => void }) {
             )}
 
             <div className="spacer" />
+
+            <QuickUnblock />
 
             <button type="button" className="btn sm" onClick={() => void clearCache()} title="Empty the DNS cache">
                 <IconRefresh size={15} />

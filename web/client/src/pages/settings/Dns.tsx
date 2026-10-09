@@ -24,6 +24,106 @@ const UPSTREAM_MODES: { value: UpstreamMode; label: string; hint: string }[] = [
     },
 ];
 
+/** How an encrypted upstream is reached, in the scheme its address carries. */
+type Transport = 'https' | 'tls' | 'quic';
+
+const TRANSPORTS: { value: Transport; label: string }[] = [
+    { value: 'https', label: 'DNS-over-HTTPS' },
+    { value: 'tls', label: 'DNS-over-TLS' },
+    { value: 'quic', label: 'DNS-over-QUIC' },
+];
+
+/**
+ * A handful of public resolvers that answer over an encrypted transport, for
+ * adding one without looking its address up.  Deliberately short: the ones
+ * people ask for, each in the variants its operator publishes.  Every one
+ * speaks DNS-over-HTTPS; the other transports only where the operator runs
+ * them.  An unfiltered variant comes first, since filtering is this server's
+ * job and a filtering upstream answers for names it never shows in the log.
+ */
+const KNOWN_UPSTREAMS: { provider: string; variants: { name: string; addr: Partial<Record<Transport, string>> }[] }[] = [
+    {
+        provider: 'Cloudflare',
+        variants: [
+            {
+                name: 'Unfiltered',
+                addr: { https: 'https://cloudflare-dns.com/dns-query', tls: 'tls://one.one.one.one' },
+            },
+            {
+                name: 'Blocks malware',
+                addr: {
+                    https: 'https://security.cloudflare-dns.com/dns-query',
+                    tls: 'tls://security.cloudflare-dns.com',
+                },
+            },
+            {
+                name: 'Blocks malware and adult sites',
+                addr: { https: 'https://family.cloudflare-dns.com/dns-query', tls: 'tls://family.cloudflare-dns.com' },
+            },
+        ],
+    },
+    {
+        provider: 'Google',
+        variants: [{ name: 'Unfiltered', addr: { https: 'https://dns.google/dns-query', tls: 'tls://dns.google' } }],
+    },
+    {
+        provider: 'Quad9',
+        variants: [
+            {
+                name: 'Unfiltered',
+                addr: { https: 'https://dns10.quad9.net/dns-query', tls: 'tls://dns10.quad9.net' },
+            },
+            { name: 'Blocks malware', addr: { https: 'https://dns.quad9.net/dns-query', tls: 'tls://dns.quad9.net' } },
+        ],
+    },
+    {
+        provider: 'AdGuard DNS',
+        variants: [
+            {
+                name: 'Unfiltered',
+                addr: {
+                    https: 'https://unfiltered.adguard-dns.com/dns-query',
+                    tls: 'tls://unfiltered.adguard-dns.com',
+                    quic: 'quic://unfiltered.adguard-dns.com',
+                },
+            },
+            {
+                name: 'Blocks ads and trackers',
+                addr: {
+                    https: 'https://dns.adguard-dns.com/dns-query',
+                    tls: 'tls://dns.adguard-dns.com',
+                    quic: 'quic://dns.adguard-dns.com',
+                },
+            },
+            {
+                name: 'Blocks ads, trackers and adult sites',
+                addr: {
+                    https: 'https://family.adguard-dns.com/dns-query',
+                    tls: 'tls://family.adguard-dns.com',
+                    quic: 'quic://family.adguard-dns.com',
+                },
+            },
+        ],
+    },
+    {
+        provider: 'Mullvad',
+        variants: [
+            { name: 'Unfiltered', addr: { https: 'https://dns.mullvad.net/dns-query', tls: 'tls://dns.mullvad.net' } },
+            {
+                name: 'Blocks ads and trackers',
+                addr: { https: 'https://adblock.dns.mullvad.net/dns-query', tls: 'tls://adblock.dns.mullvad.net' },
+            },
+        ],
+    },
+    {
+        provider: 'OpenDNS',
+        variants: [
+            { name: 'Unfiltered', addr: { https: 'https://doh.opendns.com/dns-query' } },
+            { name: 'Blocks adult sites', addr: { https: 'https://doh.familyshield.opendns.com/dns-query' } },
+        ],
+    },
+];
+
 const BLOCKING_MODES: { value: BlockingMode; label: string; hint: string }[] = [
     { value: 'default', label: 'Default', hint: 'Answer with the null address, or with whatever the matching rule says.' },
     { value: 'refused', label: 'REFUSED', hint: 'Refuse the query outright.' },
@@ -106,6 +206,17 @@ function Upstreams({ config, save }: { config: DnsConfig; save: Save }) {
                     onChange={(e) => setUpstream(e.target.value)}
                 />
             </Field>
+
+            <KnownUpstream
+                onAdd={(addr) => {
+                    const current = lines(upstream);
+                    if (current.includes(addr)) {
+                        toast.ok(`${addr} is already in the list`);
+                    } else {
+                        setUpstream(unlines([...current, addr]));
+                    }
+                }}
+            />
 
             {config.upstream_dns_file && (
                 <Notice kind="info">
@@ -195,6 +306,55 @@ function Upstreams({ config, save }: { config: DnsConfig; save: Save }) {
                 </button>
             </div>
         </Card>
+    );
+}
+
+/** Picks one of `KNOWN_UPSTREAMS` and hands its address over; nothing is saved until Apply. */
+function KnownUpstream({ onAdd }: { onAdd: (addr: string) => void }) {
+    const [pick, setPick] = useState('0:0');
+    const [transport, setTransport] = useState<Transport>('https');
+
+    const [p, v] = pick.split(':').map(Number);
+    const variant = KNOWN_UPSTREAMS[p!]!.variants[v!]!;
+    // Every variant speaks HTTPS, so a transport it lacks falls back to that.
+    const addr = variant.addr[transport] ?? variant.addr.https!;
+
+    return (
+        <div className="field">
+            <span className="field-label">Add a public server</span>
+            <div className="row">
+                <select
+                    value={pick}
+                    aria-label="Public server"
+                    style={{ width: 'auto', flex: '1 1 220px' }}
+                    onChange={(e) => setPick(e.target.value)}>
+                    {KNOWN_UPSTREAMS.map((k, pi) => (
+                        <optgroup key={k.provider} label={k.provider}>
+                            {k.variants.map((x, vi) => (
+                                <option key={x.name} value={`${pi}:${vi}`}>
+                                    {k.provider} · {x.name}
+                                </option>
+                            ))}
+                        </optgroup>
+                    ))}
+                </select>
+                <select
+                    value={variant.addr[transport] ? transport : 'https'}
+                    aria-label="Transport"
+                    style={{ width: 'auto', flex: '0 1 auto' }}
+                    onChange={(e) => setTransport(e.target.value as Transport)}>
+                    {TRANSPORTS.map((t) => (
+                        <option key={t.value} value={t.value} disabled={!variant.addr[t.value]}>
+                            {t.label}
+                        </option>
+                    ))}
+                </select>
+                <button type="button" className="btn" onClick={() => onAdd(addr)}>
+                    Add
+                </button>
+            </div>
+            <div className="hint mono">{addr}</div>
+        </div>
     );
 }
 
