@@ -212,6 +212,48 @@ async fn login_is_reachable_without_a_session() {
 }
 
 #[tokio::test]
+async fn a_stale_cookie_does_not_shadow_a_fresh_session() {
+    // The regression: a browser holding a second `agh_session` on a narrower
+    // path sends it first on every API call. Only the first was read, so
+    // signing in again answered 401 to everything, the interface bounced
+    // between `/` and the login form, and only clearing the site's data
+    // got the user back in.
+    let addr = serve(Some(("admin", "correct horse"))).await;
+
+    let (_, _, cookie) = request(
+        addr,
+        "POST",
+        "/control/login",
+        Some(r#"{"name":"admin","password":"correct horse"}"#),
+        None,
+    )
+    .await;
+    let fresh = cookie.split(';').next().unwrap();
+    let jar = format!("agh_session=00000000000000000000000000000000; {fresh}");
+
+    let (status, _, _) = request(addr, "GET", "/control/status", None, Some(&jar)).await;
+    assert_eq!(
+        status, 200,
+        "the live session must be found behind a stale one"
+    );
+
+    // Logging out expires the narrower paths too, not only `/`.
+    let (_, headers, _) = send(addr, "GET", "/control/logout", None, &[("cookie", &jar)]).await;
+    let cleared: Vec<_> = headers
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    assert!(
+        cleared.iter().any(|c| c.contains("Path=/control;")),
+        "{cleared:?}"
+    );
+
+    let (status, _, _) = request(addr, "GET", "/control/status", None, Some(&jar)).await;
+    assert_eq!(status, 401, "logout ends the session");
+}
+
+#[tokio::test]
 async fn a_wrong_password_is_still_refused() {
     let addr = serve(Some(("admin", "correct horse"))).await;
 

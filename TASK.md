@@ -888,6 +888,31 @@ still open `/control/status`. A browser pointed at the root renders AdGuard's
 login form with no native dialog and no console errors. Three tests in
 `sift-api/tests/gate.rs` cover it, including the absence of the header.
 
+## Found signing in again after signing out, and fixed
+
+Signing out and back in left the interface bouncing between `/` and
+`/login.html` for good, and only clearing the site's data broke the loop. The
+login itself succeeded every time.
+
+**Only the first `agh_session` cookie was read.** A browser sends every cookie
+of the name whose path covers the request, the narrowest first, and a second
+`agh_session` on a narrower path (`/control` here, from an older build or a
+proxy) shadowed the fresh session on every API call — but not on `/`, which
+that path does not cover. So `/` served the dashboard, every `/control/*`
+call answered 401, the interface sent itself to `login.html`, the gate saw a
+live session there and sent it back to `/`, and so on forever. Logout cleared
+only `Path=/`, so it could never remove the stale cookie either.
+
+`auth::tokens_from_cookies` yields every value, and `session_user` takes the
+first one that is a live session; logout ends every session the request names
+and expires the cookie on `/`, `/control` and `/control/` (`CLEARED_PATHS`).
+
+**Verified** in a browser against a running build, with a stale
+`agh_session` planted on `/control`: before, an endless 200/401 loop across
+`/` and `/control/status`; after, the dashboard loads and every call answers
+200. `a_stale_cookie_does_not_shadow_a_fresh_session` in
+`sift-api/tests/gate.rs` covers the lookup and the logout.
+
 ## Found reading the code after that, and fixed
 
 Two defects in the sign-in path, neither of which any test covered.

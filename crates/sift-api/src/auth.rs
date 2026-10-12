@@ -249,14 +249,28 @@ pub fn session_cookie(token: &str, ttl: Duration) -> String {
     format!("{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={secs}")
 }
 
-/// Builds the `Set-Cookie` value that clears the session.
-pub fn clear_cookie() -> String {
-    format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+/// The paths a session cookie is cleared on at logout.
+///
+/// Ours is always set on `/`, but a browser can hold another of the same name
+/// on a narrower path -- left by an older build, or by a proxy that rewrote
+/// the path -- and a cookie on `/control` is sent *ahead* of ours on every API
+/// call.  Clearing it too is the only way the server can reach it: a cookie on
+/// a path nobody names here stays until the browser's site data is cleared.
+pub const CLEARED_PATHS: &[&str] = &["/", "/control", "/control/"];
+
+/// Builds the `Set-Cookie` value that clears the session on `path`.
+pub fn clear_cookie(path: &str) -> String {
+    format!("{COOKIE_NAME}=; Path={path}; HttpOnly; SameSite=Lax; Max-Age=0")
 }
 
-/// Extracts the session token from a `Cookie` header.
-pub fn token_from_cookies(header: &str) -> Option<&str> {
-    header.split(';').find_map(|kv| {
+/// Every session token a `Cookie` header carries, in the order sent.
+///
+/// More than one is possible: a browser sends every cookie of the name whose
+/// path covers the request, the narrowest first.  Taking only the first let a
+/// stale cookie on a narrower path shadow a fresh session, and every API call
+/// answered 401 straight after a successful login.
+pub fn tokens_from_cookies(header: &str) -> impl Iterator<Item = &str> {
+    header.split(';').filter_map(|kv| {
         let (k, v) = kv.split_once('=')?;
 
         (k.trim() == COOKIE_NAME).then(|| v.trim())
@@ -1056,17 +1070,19 @@ mod tests {
         assert!(c.contains("SameSite=Lax"));
         assert!(c.contains("Max-Age=3600"));
 
-        assert!(clear_cookie().contains("Max-Age=0"));
+        assert!(clear_cookie("/").contains("Max-Age=0"));
+        assert!(clear_cookie("/control").contains("Path=/control;"));
     }
 
     #[test]
     fn parses_the_session_token_from_a_cookie_header() {
-        assert_eq!(token_from_cookies("agh_session=abc123"), Some("abc123"));
-        assert_eq!(
-            token_from_cookies("other=x; agh_session=abc123; more=y"),
-            Some("abc123")
-        );
-        assert_eq!(token_from_cookies("other=x"), None);
+        let first = |h| tokens_from_cookies(h).next();
+        assert_eq!(first("agh_session=abc123"), Some("abc123"));
+        assert_eq!(first("other=x; agh_session=abc123; more=y"), Some("abc123"));
+        assert_eq!(first("other=x"), None);
+
+        let all: Vec<_> = tokens_from_cookies("agh_session=old; x=1; agh_session=new").collect();
+        assert_eq!(all, ["old", "new"]);
     }
 
     #[test]

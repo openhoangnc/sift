@@ -918,9 +918,9 @@ pub async fn profile_update(
 /// gate's to make, under the throttle -- see `routes::authenticate`.
 pub fn session_user(s: &Shared, headers: &HeaderMap) -> Option<String> {
     let c = headers.get(header::COOKIE)?.to_str().ok()?;
-    let tok = auth::token_from_cookies(c)?;
 
-    s.sessions.get(tok).map(|sess| sess.user)
+    // Whichever of them is live: a stale one sent first must not hide it.
+    auth::tokens_from_cookies(c).find_map(|tok| s.sessions.get(tok).map(|sess| sess.user))
 }
 
 /// The stored hash of a user's password, if there is such a user.
@@ -996,15 +996,17 @@ pub async fn login(
 
 /// `GET /control/logout`
 pub async fn logout(State(s): State<Shared>, headers: HeaderMap) -> Response {
-    if let Some(c) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
-        && let Some(tok) = auth::token_from_cookies(c)
-    {
-        s.sessions.remove(tok);
+    if let Some(c) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        for tok in auth::tokens_from_cookies(c) {
+            s.sessions.remove(tok);
+        }
     }
 
     let mut out = HeaderMap::new();
-    if let Ok(v) = auth::clear_cookie().parse() {
-        out.insert(header::SET_COOKIE, v);
+    for path in auth::CLEARED_PATHS {
+        if let Ok(v) = auth::clear_cookie(path).parse() {
+            out.append(header::SET_COOKIE, v);
+        }
     }
     if let Ok(v) = "/login.html".parse() {
         out.insert(header::LOCATION, v);
