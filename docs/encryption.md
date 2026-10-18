@@ -244,6 +244,25 @@ it does not decide who should be able to reach the port in the first place.
 For a resolver only you use, `allowed_clients` with
 [ClientIDs](clients.md#clientid) is what does that.
 
+### When a client cannot connect
+
+A refused source has its connection accepted and then closed before the TLS
+handshake. A browser reports that as the connection being reset or closed,
+not as timing out. A filter on the network in between can look the same, so
+`scripts/reach.sh` in the source tree tells the two apart from the client's
+side:
+
+```sh
+sh reach.sh homeguard.example.org
+```
+
+Run it on the network that cannot connect, while it cannot. It looks the name
+up through that network's resolver and through 1.1.1.1, and fetches `/` from
+each address the name has: by name, and by bare address if that fails. The
+server refuses by address and never reads the name first, so a connection cut
+only when it carries the name is being filtered on the way. It also prints the
+machine's public address, which is what to search the server's log for.
+
 ## Strict SNI
 
 `tls.strict_sni_check: true` refuses a DNS-over-TLS or DNS-over-QUIC client

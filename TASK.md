@@ -462,6 +462,18 @@ Verification claims below are reproducible with `scripts/verify.sh` and
       archive for the wrong architecture fails then rather than after the swap.
       An existing unit file is never rewritten: it is the operator's, and both
       builds take the same arguments
+- [x] **`scripts/reach.sh`, for "it cannot be reached from out there"**: run
+      on the failing network, it says which layer failed — the name, TCP, a
+      connection cut before TLS, a certificate that is not the server's, or
+      HTTP — and gives the address to search the log for. A connection cut
+      by name and by bare address alike is how a banned source is refused;
+      cut by name only is filtering on the way, since the guard never reads
+      the name. Each fetch asks for `/`, so the check earns no strikes.
+      Verified against stand-ins for each failure on loopback (accept and
+      close, reset on a matching SNI, an untrusted certificate, a stalled
+      handshake, a closed port) and the IPv6 /64 against Python's
+      `ipaddress`; the name lookups were not run end to end, because the
+      sandbox it was written in has no DNS
 
 ---
 
