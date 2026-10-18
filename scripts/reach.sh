@@ -25,10 +25,10 @@
 #
 # What it sends, and to whom:
 #
-#   - api.ipify.org and api6.ipify.org are asked for this machine's public
-#     address, which is what to look for in Sift's log (-n skips this);
-#   - 1.1.1.1 is asked for the name over HTTPS, beside this network's own
-#     resolver, so a stale or rewritten answer shows;
+#   - Cloudflare's resolver is asked for this machine's public address, which
+#     is what to look for in Sift's log (-n skips this);
+#   - and for the name over HTTPS, beside this network's own resolver, so a
+#     stale or rewritten answer shows;
 #   - the server is asked for / -- by name, and by bare address if that
 #     failed -- and nothing else.  Each of those is a request Sift answers,
 #     so neither counts against this address with its connection guard.
@@ -138,6 +138,15 @@ local_lookup() {
 	fi | only "$1"
 }
 
+# This machine's public address, as Cloudflare's resolver at $1 sees it.
+# Asked by address, so no lookup is needed and no blocklist can stand in the
+# way -- api.ipify.org, asked by name, came back empty on a phone that
+# reached 1.1.1.1 without trouble.
+public() {
+	curl -sS --noproxy '*' --max-time 6 "https://$1/cdn-cgi/trace" 2>/dev/null |
+		sed -n 's/^ip=//p' | only "$2"
+}
+
 # 1.1.1.1 over HTTPS, one record type.
 doh_lookup() {
 	curl -sS --max-time 6 -H 'accept: application/dns-json' \
@@ -242,8 +251,8 @@ echo
 ME4=
 ME6=
 if [ "$LOOKUP_IP" -eq 1 ]; then
-	ME4=$(curl -4 -sS --noproxy '*' --max-time 6 https://api.ipify.org 2>/dev/null | only A)
-	ME6=$(curl -6 -sS --noproxy '*' --max-time 6 https://api6.ipify.org 2>/dev/null | only AAAA)
+	ME4=$(public 1.1.1.1 A)
+	ME6=$(public '[2606:4700:4700::1111]' AAAA)
 	echo "This machine, as the internet sees it"
 	echo "  IPv4  ${ME4:-none}"
 	echo "  IPv6  ${ME6:-none}"

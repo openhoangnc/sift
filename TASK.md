@@ -472,8 +472,10 @@ Verification claims below are reproducible with `scripts/verify.sh` and
       Verified against stand-ins for each failure on loopback (accept and
       close, reset on a matching SNI, an untrusted certificate, a stalled
       handshake, a closed port) and the IPv6 /64 against Python's
-      `ipaddress`; the name lookups were not run end to end, because the
-      sandbox it was written in has no DNS
+      `ipaddress`. Run for real from a phone in Termux: both lookups agreed
+      and the server answered 302. That run also showed api.ipify.org coming
+      back empty where 1.1.1.1 answered, so the public address is now read
+      from 1.1.1.1's `/cdn-cgi/trace`, asked by address
 
 ---
 
